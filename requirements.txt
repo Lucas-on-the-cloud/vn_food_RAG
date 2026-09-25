@@ -6,7 +6,6 @@ tqdm>=4.66
 scikit-learn>=1.5
 sentence-transformers>=3.0
 faiss-cpu>=1.8
-openai-whisper>=20240930
 opencv-python>=4.10
 pillow>=10.4
 ultralytics>=8.3
