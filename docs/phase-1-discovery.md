@@ -1,75 +1,159 @@
-# Phase 1A — Recipe Source Discovery
+# Phase 1A — Automated Recipe Source Discovery
 
-The first goal is intentionally small:
+The discovery step is automated. The crawler searches TikTok by keyword, scrolls the search results, extracts public video URLs, removes duplicates and writes the results to:
 
-> Collect 5-10 good TikTok recipe URLs before building transcription.
+`data/sources/video_sources.csv`
 
-Do not download 1,000 videos yet.
+It does **not** attempt to bypass CAPTCHA, login or anti-bot challenges. Run it with a visible browser first. If TikTok asks for verification, complete it normally in the opened browser and return to the terminal.
 
-## Step 1 — Choose a keyword
-
-Open:
-
-`data/sources/seed_keywords.csv`
-
-Start with high-priority keywords such as:
-
-- món ăn sinh viên
-- món ăn tiết kiệm
-- món ngon dễ làm
-- món ăn 15 phút
-- món ăn nồi cơm điện
-
-## Step 2 — Search TikTok manually
-
-Search TikTok using one keyword.
-
-Choose videos that are likely to contain an actual recipe, not only food entertainment.
-
-Prefer videos with:
-
-- visible ingredients;
-- spoken instructions or captions;
-- clear cooking steps;
-- student-friendly equipment;
-- affordable ingredients.
-
-For the first experiment, collect only 5-10 URLs.
-
-## Step 3 — Add each URL
+## 1. Install dependencies
 
 From the repository root:
 
 ```bash
-python scripts/add_source.py --url "TIKTOK_URL" --keyword "món ăn sinh viên"
+pip install -r requirements.txt
 ```
 
-Optional metadata:
+If you use Microsoft Edge (recommended on Windows), no Playwright browser download is normally needed.
+
+If Edge/Chrome launching does not work, install Playwright Chromium:
 
 ```bash
-python scripts/add_source.py ^
-  --url "TIKTOK_URL" ^
-  --keyword "món ăn sinh viên" ^
-  --creator "creator_name" ^
-  --title "video caption"
+python -m playwright install chromium
 ```
 
-On PowerShell, either run the command on one line or use the PowerShell backtick instead of `^`.
+## 2. Test one keyword first
 
-## Step 4 — Check the registry
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 10
+```
 
-Open:
+Default browser: Microsoft Edge.
 
-`data/sources/video_sources.csv`
+Expected behavior:
 
-Each accepted URL receives an ID such as:
+1. Edge opens.
+2. TikTok search opens automatically.
+3. The script scrolls.
+4. Video URLs are collected.
+5. Duplicates are skipped.
+6. New rows are saved into `data/sources/video_sources.csv`.
 
-`SRC0001`
+Example output:
 
-The script also removes tracking query parameters and rejects duplicate URLs.
+```text
+[SEARCH] món ăn sinh viên
+  scroll 00/25: 8/10 unique video links
+  scroll 01/25: 14/10 unique video links
 
-## Definition of done
+[SAVED] keyword='món ăn sinh viên' found=10 new=10 duplicates=0
+```
 
-This step is complete when `video_sources.csv` contains 5-10 useful TikTok cooking URLs.
+## 3. If TikTok asks for verification
 
-The next step will enrich these URLs automatically using TikTok oEmbed metadata before any transcription is attempted.
+Do not close the browser.
+
+Complete login/CAPTCHA/verification in the browser manually.
+
+When the terminal shows:
+
+```text
+If TikTok is showing login/CAPTCHA/verification,
+complete it in the browser window, then press ENTER here.
+```
+
+press ENTER after the page is usable.
+
+The browser profile is stored locally in:
+
+`.browser/tiktok-profile/`
+
+so the same session can be reused on later runs.
+
+## 4. Try 20 URLs for one keyword
+
+After the first test works:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 20
+```
+
+Re-running the command is safe: existing canonical video URLs are skipped.
+
+## 5. Crawl seed keywords automatically
+
+The seed file is:
+
+`data/sources/seed_keywords.csv`
+
+Test only the first 3 high-priority keywords:
+
+```bash
+python scripts/crawl_tiktok_search.py --from-seed --priority high --max-keywords 3 --limit 20
+```
+
+This requests up to about 60 discovered results before cross-keyword deduplication.
+
+Once that works, increase gradually:
+
+```bash
+python scripts/crawl_tiktok_search.py --from-seed --priority high --max-keywords 10 --limit 30
+```
+
+## 6. Browser options
+
+Use Edge:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 10 --browser edge
+```
+
+Use installed Chrome:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 10 --browser chrome
+```
+
+Use Playwright Chromium:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 10 --browser chromium
+```
+
+Visible mode is recommended during development.
+
+Headless mode is available later:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 20 --headless
+```
+
+but TikTok may behave differently in headless mode.
+
+## 7. Output columns
+
+`video_sources.csv` contains:
+
+- `source_id`
+- `url`
+- `platform`
+- `keyword`
+- `category`
+- `creator`
+- `title`
+- `status`
+- `notes`
+
+The crawler currently extracts URL and creator reliably from the link. Title text is best-effort because TikTok's rendered search DOM can change.
+
+## First milestone
+
+Do not crawl 1,000 links immediately.
+
+First run:
+
+```bash
+python scripts/crawl_tiktok_search.py --keyword "món ăn sinh viên" --limit 10
+```
+
+Inspect the resulting CSV. If the URLs are good, the next stage will add automatic metadata/relevance filtering and then URL-to-text extraction.
