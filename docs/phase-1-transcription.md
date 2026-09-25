@@ -1,101 +1,129 @@
-# Phase 1C — URL to Transcript
+# Phase 1C — TikTok URL to Transcript
 
-This stage turns a TikTok source URL into text without keeping the full video file.
+## Current implementation
 
-## Strategy
+As of September 2026, TikTok extraction through yt-dlp can fail with:
+
+`Unexpected response from webpage request`
+
+The project therefore does not depend on yt-dlp for the main transcription path.
+
+Instead it reuses the Playwright/Edge session that already works for discovery and metadata:
 
 ```text
 TikTok URL
-   |
-   +--> subtitle available? --> save transcript text
-   |
-   +--> no subtitle
-           |
-           v
-      audio-only download
-      to a temporary folder
-           |
-           v
-         Whisper
-           |
-           v
-      transcript JSON
-           |
-           v
-      temporary audio deleted
+    |
+    v
+Edge / Playwright
+    |
+    | capture the media URL the browser is already playing
+    v
+signed TikTok media URL
+    |
+    v
+FFmpeg
+    |
+    | extract audio only into a temporary WAV
+    v
+Whisper
+    |
+    v
+transcript JSON
+    |
+    v
+temporary WAV deleted
 ```
 
-The script never intentionally downloads/stores the full TikTok video.
+No full MP4 is intentionally saved to disk.
 
-## 1. Pull new code
+Note: to transcribe the full clip, FFmpeg still has to transfer enough of the remote media stream to decode its audio. The difference is that the full video file is not persisted locally.
+
+## 1. Pull the fix
 
 ```bash
 git pull origin main
 ```
 
-## 2. Install/update Python packages
+## 2. Update packages
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 3. First try subtitle-only
-
-This is the cheapest test because Whisper is not used:
-
-```bash
-python scripts/transcribe_tiktok_sources.py --source-id SRC0001 --subtitle-only
-```
-
-If TikTok exposes Vietnamese captions, output will look like:
-
-```text
-method : subtitle
-chars  : 512
-saved  : .../data/processed/transcripts/SRC0001.json
-```
-
-## 4. If subtitle is unavailable, use Whisper fallback
-
-```bash
-python scripts/transcribe_tiktok_sources.py --source-id SRC0001
-```
-
-Default Whisper model: `base`.
-
-The first Whisper run downloads the model weights once.
-
-For better Vietnamese accuracy later:
-
-```bash
-python scripts/transcribe_tiktok_sources.py --source-id SRC0001 --whisper-model small
-```
-
-## 5. FFmpeg requirement
-
-Whisper needs FFmpeg to decode audio.
-
-Check:
+## 3. Verify FFmpeg
 
 ```bash
 ffmpeg -version
 ```
 
-If Windows says `ffmpeg` is not recognized, install FFmpeg and reopen the terminal. One common Windows option is:
+If Windows cannot find FFmpeg:
 
 ```bash
 winget install Gyan.FFmpeg
 ```
 
-Then verify again:
+Then reopen PowerShell and verify again.
+
+## 4. Test SRC0001
+
+Run:
 
 ```bash
-ffmpeg -version
+python scripts/transcribe_tiktok_sources.py --source-id SRC0001
 ```
 
-## 6. Process the first 10
+Expected flow:
 
-Only after SRC0001 succeeds:
+1. Whisper loads.
+2. Edge opens SRC0001 using the persistent TikTok profile.
+3. The script captures the media stream URL.
+4. FFmpeg writes a temporary 16 kHz mono WAV.
+5. Whisper transcribes Vietnamese speech.
+6. The temporary audio is deleted.
+7. The transcript is saved to:
+
+`data/processed/transcripts/SRC0001.json`
+
+Example output:
+
+```text
+[1/1] SRC0001
+    https://www.tiktok.com/@.../video/...
+    media  : captured from browser
+    audio  : temporary WAV (840 KiB)
+    chars  : 412
+    saved  : .../data/processed/transcripts/SRC0001.json
+```
+
+## 5. Verification/login
+
+If TikTok presents login, CAPTCHA or another normal verification screen, complete it manually in the opened Edge window.
+
+Return to PowerShell and press ENTER when prompted.
+
+The project does not implement CAPTCHA bypassing.
+
+## 6. Inspect the transcript
+
+Open:
+
+`data/processed/transcripts/SRC0001.json`
+
+Important fields:
+
+```json
+{
+  "source_id": "SRC0001",
+  "method": "browser_stream_whisper",
+  "language": "vi",
+  "text": "...",
+  "segments": []
+}
+```
+
+## 7. Then process more
+
+Only after SRC0001 is correct:
 
 ```bash
 python scripts/transcribe_tiktok_sources.py --limit 10
@@ -103,42 +131,26 @@ python scripts/transcribe_tiktok_sources.py --limit 10
 
 Existing transcript JSON files are skipped automatically.
 
-To overwrite:
+To regenerate one:
 
 ```bash
 python scripts/transcribe_tiktok_sources.py --source-id SRC0001 --force
 ```
 
-## Output
+For higher Vietnamese accuracy later:
 
-Transcript files are stored locally:
-
-```text
-data/processed/transcripts/
-    SRC0001.json
-    SRC0002.json
-    ...
+```bash
+python scripts/transcribe_tiktok_sources.py --source-id SRC0001 --force --whisper-model small
 ```
 
-Example:
+## Git policy
 
-```json
-{
-  "source_id": "SRC0001",
-  "url": "https://www.tiktok.com/@.../video/...",
-  "video_id": "...",
-  "title": "...",
-  "method": "subtitle",
-  "language": "vi-VN",
-  "text": "Hôm nay mình sẽ...",
-  "segments": []
-}
-```
+`data/processed/` remains ignored by Git while we are debugging the pipeline.
 
-The `data/processed` directory is intentionally ignored by Git for now because these are intermediate artifacts.
+Once the transcript schema is stable, we will decide whether to version the final cleaned text dataset separately.
 
 ## Next stage
 
-After 10 transcripts are working, Phase 1D will convert each transcript into strict structured recipe JSON:
+After 10 transcripts work:
 
-`transcript -> ingredients + quantities + steps -> validated recipe record`.
+`transcript -> recipe extraction -> ingredient normalization -> validated recipe JSON`
