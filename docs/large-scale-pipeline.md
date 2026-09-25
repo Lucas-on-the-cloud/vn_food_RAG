@@ -29,7 +29,7 @@ The exact yield depends on the source mix.
 Start with high-priority cooking keywords:
 
 ```powershell
-python scripts/crawl_tiktok_search.py --from-seed --priority high --target-new 200 --limit 30
+python scripts/crawl_tiktok_search.py --from-seed --priority high --target-new 200 --limit 30 --workers 4
 ```
 
 The crawler:
@@ -46,7 +46,7 @@ The crawler:
 If high-priority keywords do not produce enough unique URLs, continue with all priorities:
 
 ```powershell
-python scripts/crawl_tiktok_search.py --from-seed --priority all --target-new 100 --limit 30
+python scripts/crawl_tiktok_search.py --from-seed --priority all --target-new 100 --limit 30 --workers 4
 ```
 
 Because the CSV deduplicates URLs, repeating a crawl is safe.
@@ -54,7 +54,7 @@ Because the CSV deduplicates URLs, repeating a crawl is safe.
 ## Stage 2 — Enrich metadata and score relevance
 
 ```powershell
-python scripts/enrich_tiktok_metadata.py
+python scripts/enrich_tiktok_metadata.py --workers 5
 ```
 
 This fills:
@@ -147,3 +147,16 @@ quality        -> accepted/rejected CSV
 ```
 
 For a 200-video run, do not restart from zero after a failure. Rerun the failed stage.
+
+
+## Parallelism Summary
+
+The scalable stages now use concurrency where it is safe:
+
+- TikTok discovery: multiple keyword pages in parallel (`--workers`)
+- Metadata enrichment: multiple TikTok video pages in parallel (`--workers`)
+- Saveto acquisition: multiple Saveto pages in parallel (`--workers`)
+- Transcript quality gate: thread-pool processing in parallel (`--workers`)
+
+Shared CSV writes remain serialized intentionally to avoid duplicate source IDs,
+lost rows, and file corruption.
