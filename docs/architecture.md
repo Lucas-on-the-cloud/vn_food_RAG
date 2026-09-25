@@ -1,104 +1,114 @@
 # System Architecture
 
-## High-level pipeline
+## Objective
+
+Given ingredients available to a student in Taiwan, recommend practical Vietnamese dishes and explain how to cook them.
+
+## Main Pipeline
 
 ```text
-Recipe sources
-    |
-    +--> audio / captions / metadata
-              |
-              v
-        transcription
-              |
-              v
-      recipe extraction
-              |
-              v
-     normalized recipe DB
-              |
-              +-----------------------+
-                                      |
-Ingredient photos                     |
-      |                               |
-      v                               |
-vision classifier / detector          |
-      |                               |
-      v                               |
-canonical ingredient IDs              |
-      |                               |
-      +-----------> retrieval --------+
-                         |
-                         v
-                   recommendation
-                         |
-                         v
-                    RAG assistant
+A. Recipe knowledge pipeline
+
+TikTok keyword discovery
+        |
+        v
+source URL + metadata
+        |
+        v
+Saveto transcript generation
+        |
+        v
+raw transcript (.txt)
+        |
+        v
+parallel quality gate
+        |
+        v
+structured recipe extraction
+        |
+        v
+normalized recipe knowledge base
+
+
+B. Ingredient vision pipeline
+
+Taiwan ingredient images
+        |
+        v
+image classification / detection
+        |
+        v
+canonical ingredient IDs
+
+
+C. Recommendation pipeline
+
+recognized ingredients
+        +
+recipe knowledge base
+        |
+        v
+candidate retrieval
+        |
+        v
+ranking
+        |
+        v
+RAG cooking assistant
 ```
 
-## Design principle
+## Transcription Boundary
 
-The project separates three tasks:
+Saveto is an external transcription provider, not a component implemented by this repository.
 
-1. **Perception** — identify ingredients from images.
-2. **Retrieval/ranking** — find recipes supported by the available ingredients and user constraints.
-3. **Generation** — explain retrieved recipes in natural Vietnamese.
+The repository begins automated processing after a transcript has been copied/downloaded locally.
 
-This separation makes each component independently measurable.
+This boundary keeps the codebase independent from TikTok media decoding, FFmpeg and GPU speech recognition.
 
-## Baselines before advanced AI
+## Parallel Processing
 
-The project should establish simple baselines first:
+Transcript post-processing is embarrassingly parallel because each source is independent.
 
-- exact ingredient matching before embedding retrieval;
-- lexical recipe search before vector search;
-- image classification before multi-object detection;
-- deterministic ranking before learned ranking;
-- grounded generation after retrieval rather than recipe generation from memory.
+For the first batch:
 
-## Evaluation
+```text
+SRC0001.txt --+
+SRC0002.txt --+
+SRC0003.txt --+
+...            +--> ThreadPoolExecutor --> quality results
+SRC0010.txt --+
+```
 
-### Ingredient recognition
+The default test uses 10 workers for 10 transcripts. Missing or malformed samples are skipped rather than blocking the batch.
 
-Potential metrics:
+Later, structured recipe extraction can use the same per-source parallel architecture.
 
-- accuracy / macro F1 for classification;
-- mAP50 and mAP50-95 after moving to object detection.
+## Failure Policy
 
-### Retrieval
+Individual failures are not treated as pipeline failures.
 
-Potential metrics:
+Examples:
 
-- Precision@K
-- Recall@K
-- MRR
-- human relevance labels
+- video unavailable
+- transcript unavailable
+- no useful speech
+- music-only content
+- repeated/hallucinated transcript
+- non-recipe video
 
-### Recommendation
+These samples are logged and skipped.
 
-Evaluate whether recommended recipes satisfy:
+The pipeline should only be debugged when failures become systematic across a large fraction of sources.
 
-- ingredient availability;
-- budget;
-- cooking time;
-- difficulty;
-- number of missing ingredients.
+## Research Focus
 
-### RAG
+The project should spend effort on:
 
-Measure:
+- recipe representation,
+- ingredient normalization,
+- ingredient recognition,
+- retrieval,
+- recommendation,
+- evaluation.
 
-- recipe retrieval relevance;
-- factual consistency with retrieved recipe;
-- unsupported ingredient/step hallucination rate;
-- user usefulness ratings.
-
-## MVP sequence
-
-1. Manually curate 20 ingredient classes.
-2. Create 100 structured recipes.
-3. Implement deterministic ingredient matching.
-4. Establish retrieval baseline.
-5. Train ingredient classifier.
-6. Connect recognition -> recommendation.
-7. Add vector retrieval.
-8. Add RAG response generation.
+Transcription is treated as upstream data acquisition.
