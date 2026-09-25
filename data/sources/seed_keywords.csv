@@ -1,0 +1,31 @@
+keyword,category,priority
+món ăn sinh viên,student,high
+nấu ăn sinh viên,student,high
+cơm sinh viên,student,high
+bữa cơm sinh viên,student,high
+thực đơn sinh viên,student,medium
+món ăn tiết kiệm,budget,high
+nấu ăn tiết kiệm,budget,high
+cơm dưới 50k,budget,high
+món ăn dưới 50k,budget,high
+bữa ăn 50k,budget,medium
+món ngon dễ làm,easy,high
+món ăn đơn giản,easy,high
+nấu ăn cho người mới,easy,high
+món ăn ít nguyên liệu,easy,high
+món ăn 3 nguyên liệu,easy,medium
+món ăn 5 nguyên liệu,easy,medium
+món ăn 15 phút,quick,high
+món ăn 20 phút,quick,high
+cơm nhanh,quick,medium
+nấu ăn nhanh,quick,high
+món ăn nồi cơm điện,equipment,high
+nấu ăn bằng nồi cơm điện,equipment,high
+món ăn một chảo,equipment,high
+món mặn dễ làm,dish_type,medium
+món xào dễ làm,dish_type,medium
+món canh dễ làm,dish_type,medium
+món trứng dễ làm,ingredient,high
+món thịt dễ làm,ingredient,high
+đậu phụ món ngon,ingredient,medium
+ức gà tiết kiệm,ingredient,medium
