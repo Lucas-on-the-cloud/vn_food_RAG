@@ -16,6 +16,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Local persistent browser profiles
+.browser/
+
 # Data - keep raw/large files local
 data/raw/*
 !data/raw/.gitkeep
