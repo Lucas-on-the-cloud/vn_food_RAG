@@ -15,14 +15,20 @@ SOURCES_PATH = ROOT / "data" / "sources" / "video_sources.csv"
 KEYWORDS_PATH = ROOT / "data" / "sources" / "seed_keywords.csv"
 DEFAULT_PROFILE_DIR = ROOT / ".browser" / "tiktok-profile"
 
+# Keep this schema aligned with enrich_tiktok_metadata.py.
 FIELDNAMES = [
     "source_id",
+    "video_id",
     "url",
     "platform",
     "keyword",
     "category",
     "creator",
+    "author_name",
     "title",
+    "thumbnail_url",
+    "relevance_score",
+    "relevance_label",
     "status",
     "notes",
 ]
@@ -36,7 +42,6 @@ SOURCE_ID_RE = re.compile(r"^SRC(\d+)$")
 
 def canonical_video_url(url: str) -> str | None:
     """Return a stable TikTok video URL or None if this is not a video URL."""
-
     if url.startswith("/"):
         url = f"https://www.tiktok.com{url}"
 
@@ -51,6 +56,11 @@ def canonical_video_url(url: str) -> str | None:
 def creator_from_url(url: str) -> str:
     match = VIDEO_URL_RE.search(url)
     return match.group(1) if match else ""
+
+
+def video_id_from_url(url: str) -> str:
+    match = VIDEO_URL_RE.search(url)
+    return match.group(2) if match else ""
 
 
 def clean_text(text: str, max_length: int = 400) -> str:
@@ -75,7 +85,13 @@ def load_source_rows() -> list[dict[str, str]]:
         return []
 
     with SOURCES_PATH.open("r", encoding="utf-8-sig", newline="") as file:
-        return list(csv.DictReader(file))
+        rows: list[dict[str, str]] = []
+        for source_row in csv.DictReader(file):
+            rows.append({
+                field: source_row.get(field, "") or ""
+                for field in FIELDNAMES
+            })
+        return rows
 
 
 def write_source_rows(rows: list[dict[str, str]]) -> None:
@@ -84,7 +100,11 @@ def write_source_rows(rows: list[dict[str, str]]) -> None:
     with SOURCES_PATH.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({
+                field: row.get(field, "") or ""
+                for field in FIELDNAMES
+            })
 
 
 def next_source_number(rows: list[dict[str, str]]) -> int:
@@ -98,18 +118,21 @@ def next_source_number(rows: list[dict[str, str]]) -> int:
     return current_max + 1
 
 
+def current_unique_count() -> int:
+    return len({
+        canonical
+        for row in load_source_rows()
+        if (canonical := canonical_video_url(row.get("url", "")))
+    })
+
+
 def launch_context(
     playwright: Playwright,
     browser_name: str,
     profile_dir: Path,
     headless: bool,
 ) -> BrowserContext:
-    """Launch a persistent normal browser profile.
-
-    We intentionally do not implement CAPTCHA or anti-bot bypasses. If TikTok
-    asks for verification, use the visible browser and complete it manually.
-    """
-
+    """Launch a persistent normal browser profile."""
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     common = {
@@ -135,8 +158,6 @@ def launch_context(
 
 
 def extract_visible_video_links(page: Page) -> list[dict[str, str]]:
-    """Collect currently rendered TikTok video anchors from the search DOM."""
-
     raw_items = page.locator('a[href*="/video/"]').evaluate_all(
         """
         (elements) => elements.map((a) => ({
@@ -204,12 +225,10 @@ def crawl_keyword(
             stagnant_rounds = 0
             previous_count = len(found)
 
-        # TikTok can show a verification/login wall. We do not bypass it.
-        # In visible mode, give the user one chance to resolve it normally.
         if stagnant_rounds == 3 and not headless and len(found) == 0:
             print(
                 "\n[NOTICE] No video links are visible yet. "
-                "If TikTok is showing login/CAPTCHA/verification, complete it "
+                "If TikTok shows login/CAPTCHA/verification, complete it "
                 "in the browser window, then press ENTER here."
             )
             try:
@@ -231,6 +250,7 @@ def crawl_keyword(
 def save_discovered(
     keyword: str,
     items: list[dict[str, str]],
+    max_new: int | None = None,
 ) -> tuple[int, int]:
     rows = load_source_rows()
     categories = keyword_category_map()
@@ -247,6 +267,9 @@ def save_discovered(
     duplicates = 0
 
     for item in items:
+        if max_new is not None and added >= max_new:
+            break
+
         url = item["url"]
 
         if url in existing_urls:
@@ -256,12 +279,17 @@ def save_discovered(
         rows.append(
             {
                 "source_id": f"SRC{source_number:04d}",
+                "video_id": video_id_from_url(url),
                 "url": url,
                 "platform": "tiktok",
                 "keyword": keyword,
                 "category": category,
                 "creator": item.get("creator", ""),
+                "author_name": "",
                 "title": item.get("title", ""),
+                "thumbnail_url": "",
+                "relevance_score": "",
+                "relevance_label": "",
                 "status": "new",
                 "notes": "auto_discovered_from_tiktok_search",
             }
@@ -297,8 +325,8 @@ def select_keywords(args: argparse.Namespace) -> list[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search TikTok by keyword, auto-scroll results, collect video URLs, "
-            "deduplicate them, and append them to video_sources.csv."
+            "Search TikTok by recipe keywords, auto-scroll results, collect "
+            "video URLs, deduplicate them, and append them to video_sources.csv."
         )
     )
 
@@ -313,6 +341,20 @@ def parse_args() -> argparse.Namespace:
         help="Read keywords from data/sources/seed_keywords.csv",
     )
 
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument(
+        "--target-new",
+        type=int,
+        default=None,
+        help="Stop after adding N new unique URLs in this run.",
+    )
+    target.add_argument(
+        "--target-total",
+        type=int,
+        default=None,
+        help="Stop when video_sources.csv reaches N unique URLs total.",
+    )
+
     parser.add_argument(
         "--priority",
         choices=["high", "medium", "low", "all"],
@@ -323,41 +365,35 @@ def parse_args() -> argparse.Namespace:
         "--max-keywords",
         type=int,
         default=None,
-        help="When using --from-seed, crawl only the first N selected keywords",
+        help="Crawl only the first N selected seed keywords.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="Maximum discovered video links per keyword (default: 20)",
+        default=30,
+        help="Maximum discovered links per keyword (default: 30).",
     )
     parser.add_argument(
         "--max-scrolls",
         type=int,
-        default=25,
-        help="Maximum scroll attempts per keyword (default: 25)",
+        default=30,
+        help="Maximum scroll attempts per keyword (default: 30).",
     )
     parser.add_argument(
         "--scroll-wait-ms",
         type=int,
         default=1400,
-        help="Wait after each scroll for lazy loading (default: 1400ms)",
+        help="Wait after each scroll for lazy loading (default: 1400ms).",
     )
     parser.add_argument(
         "--browser",
         choices=["edge", "chrome", "chromium"],
         default="edge",
-        help="Browser controlled by Playwright (default: edge)",
     )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without a visible browser. Visible mode is recommended first.",
-    )
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--profile-dir",
         default=str(DEFAULT_PROFILE_DIR),
-        help="Persistent browser profile directory",
     )
 
     return parser.parse_args()
@@ -373,14 +409,30 @@ def main() -> None:
     if not keywords:
         raise SystemExit("No keywords selected.")
 
+    initial_total = current_unique_count()
+
+    if args.target_total is not None:
+        goal_new = max(0, args.target_total - initial_total)
+    else:
+        goal_new = args.target_new
+
+    if goal_new == 0:
+        print(
+            f"Already have {initial_total} unique URLs, "
+            "so the requested target is satisfied."
+        )
+        return
+
     print("=" * 70)
     print("TikTok Recipe URL Discovery")
     print("=" * 70)
-    print(f"Keywords      : {len(keywords)}")
-    print(f"Limit/keyword : {args.limit}")
-    print(f"Browser       : {args.browser}")
-    print(f"Headless      : {args.headless}")
-    print(f"Output        : {SOURCES_PATH}")
+    print(f"Existing URLs  : {initial_total}")
+    print(f"Keywords       : {len(keywords)}")
+    print(f"Limit/keyword  : {args.limit}")
+    print(f"Target new     : {goal_new if goal_new is not None else 'unlimited'}")
+    print(f"Browser        : {args.browser}")
+    print(f"Headless       : {args.headless}")
+    print(f"Output         : {SOURCES_PATH}")
 
     total_found = 0
     total_added = 0
@@ -399,6 +451,9 @@ def main() -> None:
             page.set_default_timeout(15_000)
 
             for keyword in keywords:
+                if goal_new is not None and total_added >= goal_new:
+                    break
+
                 items = crawl_keyword(
                     page=page,
                     keyword=keyword,
@@ -408,7 +463,17 @@ def main() -> None:
                     headless=args.headless,
                 )
 
-                added, duplicates = save_discovered(keyword, items)
+                remaining = (
+                    None
+                    if goal_new is None
+                    else max(0, goal_new - total_added)
+                )
+
+                added, duplicates = save_discovered(
+                    keyword,
+                    items,
+                    max_new=remaining,
+                )
 
                 total_found += len(items)
                 total_added += added
@@ -416,28 +481,33 @@ def main() -> None:
 
                 print(
                     f"[SAVED] keyword={keyword!r} "
-                    f"found={len(items)} new={added} duplicates={duplicates}"
+                    f"found={len(items)} new={added} "
+                    f"duplicates={duplicates} total_new={total_added}"
                 )
 
             context.close()
 
     except Exception as exc:
         print(f"\n[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
-        print(
-            "\nIf the browser could not launch:\n"
-            "  Edge:    python scripts/crawl_tiktok_search.py ... --browser edge\n"
-            "  Chrome:  python scripts/crawl_tiktok_search.py ... --browser chrome\n"
-            "  Chromium: python -m playwright install chromium\n",
-            file=sys.stderr,
-        )
         raise SystemExit(1) from exc
+
+    final_total = current_unique_count()
 
     print("\n" + "=" * 70)
     print("DONE")
     print(f"Collected this run : {total_found}")
     print(f"New URLs saved     : {total_added}")
     print(f"Duplicates skipped : {total_duplicates}")
-    print(f"CSV                 : {SOURCES_PATH}")
+    print(f"Total unique URLs  : {final_total}")
+    print(f"CSV                : {SOURCES_PATH}")
+
+    if goal_new is not None and total_added < goal_new:
+        print(
+            f"NOTE: target was not fully reached; "
+            f"{goal_new - total_added} more new URLs are needed. "
+            "Run again or include medium-priority seed keywords."
+        )
+
     print("=" * 70)
 
 
