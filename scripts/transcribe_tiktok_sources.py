@@ -5,24 +5,21 @@ import csv
 import json
 import re
 import shutil
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
-from urllib.request import Request, urlopen
 
-import yt_dlp
+from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES_PATH = ROOT / "data" / "sources" / "video_sources.csv"
 TRANSCRIPT_DIR = ROOT / "data" / "processed" / "transcripts"
+DEFAULT_PROFILE_DIR = ROOT / ".browser" / "tiktok-profile"
 
-
-TIMECODE_RE = re.compile(
-    r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{3}\s+-->\s+"
-    r"(?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{3}"
-)
-TAG_RE = re.compile(r"<[^>]+>")
+VIDEO_ID_RE = re.compile(r"/video/(\d+)")
 
 
 def load_sources() -> list[dict[str, str]]:
@@ -30,276 +27,279 @@ def load_sources() -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
-def clean_subtitle_text(raw: str) -> str:
-    """Convert SRT/VTT-like subtitle text into plain text."""
-
-    lines: list[str] = []
-    seen: set[str] = set()
-
-    for line in raw.splitlines():
-        value = line.strip()
-
-        if not value:
-            continue
-
-        if value.upper() == "WEBVTT":
-            continue
-
-        if value.isdigit():
-            continue
-
-        if TIMECODE_RE.match(value):
-            continue
-
-        if value.startswith(("NOTE", "STYLE", "REGION")):
-            continue
-
-        value = TAG_RE.sub("", value).strip()
-
-        if not value or value in seen:
-            continue
-
-        seen.add(value)
-        lines.append(value)
-
-    return " ".join(lines).strip()
+def extract_video_id(url: str) -> str:
+    match = VIDEO_ID_RE.search(url)
+    return match.group(1) if match else ""
 
 
-def parse_json_subtitle(raw: str) -> tuple[str, list[dict[str, Any]]]:
-    """Parse common TikTok/creator-caption JSON structures."""
+def launch_context(
+    playwright: Playwright,
+    browser_name: str,
+    profile_dir: Path,
+    headless: bool,
+) -> BrowserContext:
+    profile_dir.mkdir(parents=True, exist_ok=True)
 
-    payload = json.loads(raw)
+    common = {
+        "user_data_dir": str(profile_dir),
+        "headless": headless,
+        "viewport": {"width": 1440, "height": 1000},
+        "locale": "vi-VN",
+    }
 
-    utterances: list[dict[str, Any]] = []
-
-    if isinstance(payload, dict):
-        candidates = payload.get("utterances")
-        if isinstance(candidates, list):
-            utterances = candidates
-
-        if not utterances:
-            captions = payload.get("captions")
-            if isinstance(captions, list):
-                utterances = captions
-
-    segments: list[dict[str, Any]] = []
-    texts: list[str] = []
-
-    for item in utterances:
-        if not isinstance(item, dict):
-            continue
-
-        text = str(item.get("text", "") or "").strip()
-        if not text:
-            continue
-
-        start = item.get("start_time", item.get("start", None))
-        end = item.get("end_time", item.get("end", None))
-
-        # TikTok caption JSON commonly stores milliseconds.
-        if isinstance(start, (int, float)) and start > 1000:
-            start = start / 1000
-        if isinstance(end, (int, float)) and end > 1000:
-            end = end / 1000
-
-        segments.append(
-            {
-                "start": start,
-                "end": end,
-                "text": text,
-            }
+    if browser_name == "edge":
+        return playwright.chromium.launch_persistent_context(
+            channel="msedge",
+            **common,
         )
-        texts.append(text)
 
-    return " ".join(texts).strip(), segments
+    if browser_name == "chrome":
+        return playwright.chromium.launch_persistent_context(
+            channel="chrome",
+            **common,
+        )
 
-
-def language_rank(language: str) -> int:
-    value = language.lower()
-
-    if value in {"vi", "vi-vn", "vie", "vietnamese"}:
-        return 100
-    if value.startswith("vi"):
-        return 90
-    if "vietnam" in value:
-        return 80
-    if value.startswith("en"):
-        return 20
-    return 0
+    return playwright.chromium.launch_persistent_context(**common)
 
 
-def choose_subtitle_track(info: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
-    subtitle_groups = []
+def is_http_media_url(url: str) -> bool:
+    value = (url or "").lower()
+    return value.startswith(("http://", "https://"))
 
-    for field in ("subtitles", "automatic_captions"):
-        group = info.get(field)
-        if isinstance(group, dict):
-            subtitle_groups.append(group)
 
-    candidates: list[tuple[int, str, dict[str, Any]]] = []
+def looks_like_media(url: str, content_type: str = "") -> bool:
+    lower_url = (url or "").lower()
+    lower_type = (content_type or "").lower()
 
-    for group in subtitle_groups:
-        for language, tracks in group.items():
-            if not isinstance(tracks, list):
-                continue
+    return (
+        lower_type.startswith("video/")
+        or lower_type.startswith("audio/")
+        or "mime_type=video" in lower_url
+        or "mime_type=audio" in lower_url
+        or "tiktokcdn.com/video/" in lower_url
+        or "tiktok.com/video/" in lower_url
+    )
 
-            for track in tracks:
-                if not isinstance(track, dict):
-                    continue
 
-                ext = str(track.get("ext", "") or "").lower()
-                format_bonus = {
-                    "vtt": 3,
-                    "srt": 3,
-                    "json": 2,
-                }.get(ext, 0)
+def choose_media_url(
+    current_src: str,
+    captured: list[dict[str, str]],
+) -> str | None:
+    """Prefer the exact media source used by the <video> element.
 
-                candidates.append(
-                    (
-                        language_rank(str(language)) + format_bonus,
-                        str(language),
-                        track,
-                    )
-                )
+    If TikTok exposes only a blob: URL, fall back to HTTP media responses
+    captured while the browser loaded the page.
+    """
 
-    if not candidates:
+    if is_http_media_url(current_src):
+        return current_src
+
+    usable = [
+        item
+        for item in captured
+        if is_http_media_url(item.get("url", ""))
+        and looks_like_media(
+            item.get("url", ""),
+            item.get("content_type", ""),
+        )
+    ]
+
+    if not usable:
         return None
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    _, language, track = candidates[0]
+    # Prefer video responses because they contain the exact mixed audio heard
+    # in the TikTok video. Separate audio requests may represent only a music
+    # track rather than the creator's full spoken audio.
+    video_candidates = [
+        item
+        for item in usable
+        if item.get("content_type", "").lower().startswith("video/")
+        or "mime_type=video" in item.get("url", "").lower()
+    ]
 
-    # Do not silently use unrelated-language subtitles.
-    if language_rank(language) <= 0:
-        return None
-
-    return language, track
+    selected = video_candidates[-1] if video_candidates else usable[-1]
+    return selected["url"]
 
 
-def fetch_subtitle_payload(
-    track: dict[str, Any],
-    info: dict[str, Any],
-) -> str:
-    if track.get("data"):
-        return str(track["data"])
+def get_current_video_src(page: Page) -> str:
+    locator = page.locator("video")
 
-    url = track.get("url")
-    if not url:
-        raise RuntimeError("Selected subtitle track has neither data nor URL.")
+    if locator.count() == 0:
+        return ""
 
-    headers: dict[str, str] = {}
-    for source in (info.get("http_headers"), track.get("http_headers")):
-        if isinstance(source, dict):
-            headers.update(
-                {
-                    str(key): str(value)
-                    for key, value in source.items()
-                    if value is not None
-                }
+    try:
+        return str(
+            locator.first.evaluate(
+                "(video) => video.currentSrc || video.src || ''"
             )
-
-    request = Request(str(url), headers=headers)
-
-    with urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", errors="replace")
-
-
-def extract_subtitle_transcript(
-    info: dict[str, Any],
-) -> dict[str, Any] | None:
-    selected = choose_subtitle_track(info)
-    if selected is None:
-        return None
-
-    language, track = selected
-    raw = fetch_subtitle_payload(track, info)
-    ext = str(track.get("ext", "") or "").lower()
-
-    if ext == "json":
-        text, segments = parse_json_subtitle(raw)
-    else:
-        text = clean_subtitle_text(raw)
-        segments = []
-
-    if not text:
-        return None
-
-    return {
-        "method": "subtitle",
-        "language": language,
-        "text": text,
-        "segments": segments,
-    }
+            or ""
+        )
+    except Exception:
+        return ""
 
 
-def build_ydl_options(quiet: bool = True) -> dict[str, Any]:
-    return {
-        "quiet": quiet,
-        "no_warnings": quiet,
-        "noplaylist": True,
-        "skip_download": True,
-    }
+def collect_media_url(
+    page: Page,
+    url: str,
+    wait_ms: int,
+    headless: bool,
+) -> tuple[str, str]:
+    captured: list[dict[str, str]] = []
+
+    def on_response(response: Any) -> None:
+        try:
+            response_url = str(response.url)
+            headers = response.headers
+            content_type = str(headers.get("content-type", "") or "")
+
+            if looks_like_media(response_url, content_type):
+                captured.append(
+                    {
+                        "url": response_url,
+                        "content_type": content_type,
+                    }
+                )
+        except Exception:
+            # Network-event parsing should never crash the transcription run.
+            pass
+
+    page.on("response", on_response)
+
+    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_timeout(wait_ms)
+
+    current_src = get_current_video_src(page)
+    media_url = choose_media_url(current_src, captured)
+
+    if media_url is None and not headless:
+        print(
+            "    No media URL found yet. If TikTok shows login/CAPTCHA/"
+            "verification, complete it in Edge, then press ENTER here."
+        )
+        try:
+            input()
+        except EOFError:
+            pass
+
+        page.wait_for_timeout(2_000)
+
+        # Encourage the media element to actually load/play.
+        video = page.locator("video")
+        if video.count() > 0:
+            try:
+                video.first.evaluate(
+                    """async (v) => {
+                        v.muted = true;
+                        try { await v.play(); } catch (_) {}
+                    }"""
+                )
+            except Exception:
+                pass
+
+        page.wait_for_timeout(2_000)
+        current_src = get_current_video_src(page)
+        media_url = choose_media_url(current_src, captured)
+
+    if media_url is None:
+        raise RuntimeError(
+            "TikTok page opened, but no HTTP media stream could be captured."
+        )
+
+    user_agent = str(
+        page.evaluate("() => navigator.userAgent") or ""
+    ).strip()
+
+    return media_url, user_agent
 
 
-def extract_info(url: str) -> dict[str, Any]:
-    with yt_dlp.YoutubeDL(build_ydl_options()) as ydl:
-        info = ydl.extract_info(url, download=False)
+def build_cookie_header(
+    context: BrowserContext,
+    media_url: str,
+) -> str:
+    try:
+        cookies = context.cookies([media_url])
+    except Exception:
+        cookies = []
 
-    if not isinstance(info, dict):
-        raise RuntimeError("yt-dlp returned no metadata.")
+    pairs = [
+        f"{cookie.get('name')}={cookie.get('value')}"
+        for cookie in cookies
+        if cookie.get("name")
+    ]
 
-    return info
-
-
-def download_audio_only(url: str, temp_dir: Path) -> Path:
-    output_template = str(temp_dir / "%(id)s.%(ext)s")
-
-    options: dict[str, Any] = {
-        "quiet": False,
-        "noplaylist": True,
-        "format": "bestaudio",
-        "outtmpl": output_template,
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-        if not isinstance(info, dict):
-            raise RuntimeError("Unable to download audio-only media.")
-
-        requested = info.get("requested_downloads")
-        candidate_paths: list[Path] = []
-
-        if isinstance(requested, list):
-            for item in requested:
-                if isinstance(item, dict):
-                    filepath = item.get("filepath")
-                    if filepath:
-                        candidate_paths.append(Path(str(filepath)))
-
-        filename = ydl.prepare_filename(info)
-        if filename:
-            candidate_paths.append(Path(filename))
-
-    for path in candidate_paths:
-        if path.exists():
-            return path
-
-    files = [path for path in temp_dir.iterdir() if path.is_file()]
-    if files:
-        return files[0]
-
-    raise RuntimeError("Audio download finished but no local audio file was found.")
+    return "; ".join(pairs)
 
 
-def whisper_transcribe(audio_path: Path, model_name: str) -> dict[str, Any]:
+def stream_media_to_wav(
+    media_url: str,
+    wav_path: Path,
+    user_agent: str,
+    referer: str,
+    cookie_header: str,
+) -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
-            "FFmpeg is required for Whisper audio decoding but was not found in PATH."
+            "FFmpeg was not found in PATH. Run: ffmpeg -version"
         )
 
-    import whisper
+    headers = [f"Referer: {referer}"]
 
-    model = whisper.load_model(model_name)
+    if cookie_header:
+        headers.append(f"Cookie: {cookie_header}")
+
+    # FFmpeg expects CRLF-separated HTTP headers.
+    header_value = "\r\n".join(headers) + "\r\n"
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+    ]
+
+    if user_agent:
+        command.extend(["-user_agent", user_agent])
+
+    command.extend(
+        [
+            "-headers",
+            header_value,
+            "-i",
+            media_url,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ]
+    )
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            "FFmpeg could not read the TikTok media stream. "
+            f"Details: {details[-1000:]}"
+        )
+
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg completed but produced no audio WAV file.")
+
+
+def whisper_transcribe(
+    audio_path: Path,
+    model: Any,
+) -> dict[str, Any]:
     result = model.transcribe(
         str(audio_path),
         language="vi",
@@ -317,44 +317,10 @@ def whisper_transcribe(audio_path: Path, model_name: str) -> dict[str, Any]:
     ]
 
     return {
-        "method": "whisper",
+        "method": "browser_stream_whisper",
         "language": str(result.get("language", "vi")),
         "text": str(result.get("text", "")).strip(),
         "segments": segments,
-    }
-
-
-def transcribe_source(
-    row: dict[str, str],
-    whisper_model: str,
-    subtitle_only: bool,
-) -> dict[str, Any]:
-    url = row["url"]
-    info = extract_info(url)
-
-    subtitle_result = extract_subtitle_transcript(info)
-    if subtitle_result is not None:
-        return {
-            "source_id": row["source_id"],
-            "url": url,
-            "video_id": str(info.get("id", "") or ""),
-            "title": str(info.get("description") or info.get("title") or ""),
-            **subtitle_result,
-        }
-
-    if subtitle_only:
-        raise RuntimeError("No usable Vietnamese subtitle was found.")
-
-    with tempfile.TemporaryDirectory(prefix="vn_food_rag_") as temp:
-        audio_path = download_audio_only(url, Path(temp))
-        whisper_result = whisper_transcribe(audio_path, whisper_model)
-
-    return {
-        "source_id": row["source_id"],
-        "url": url,
-        "video_id": str(info.get("id", "") or ""),
-        "title": str(info.get("description") or info.get("title") or ""),
-        **whisper_result,
     }
 
 
@@ -370,11 +336,38 @@ def save_transcript(result: dict[str, Any]) -> Path:
     return output
 
 
+def select_rows(
+    rows: list[dict[str, str]],
+    source_id: str | None,
+    limit: int | None,
+    force: bool,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+
+    for row in rows:
+        if source_id and row.get("source_id") != source_id:
+            continue
+
+        output = TRANSCRIPT_DIR / f"{row.get('source_id', '')}.json"
+
+        if output.exists() and not force:
+            print(f"[SKIP] {row.get('source_id')} transcript already exists")
+            continue
+
+        selected.append(row)
+
+        if limit is not None and len(selected) >= limit:
+            break
+
+    return selected
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert TikTok source URLs into text. Prefer existing subtitles; "
-            "otherwise download only temporary audio and transcribe with Whisper."
+            "Open each TikTok URL in the existing browser session, capture the "
+            "media stream, extract temporary audio with FFmpeg, and transcribe "
+            "Vietnamese speech with Whisper. No full video is saved."
         )
     )
     parser.add_argument(
@@ -391,17 +384,40 @@ def parse_args() -> argparse.Namespace:
         "--whisper-model",
         default="base",
         choices=["tiny", "base", "small", "medium", "large"],
-        help="Whisper model used only when subtitle fallback is needed.",
-    )
-    parser.add_argument(
-        "--subtitle-only",
-        action="store_true",
-        help="Do not download audio; fail if usable subtitles are unavailable.",
+        help="Whisper model (default: base).",
     )
     parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite an existing transcript JSON.",
+    )
+    parser.add_argument(
+        "--browser",
+        choices=["edge", "chrome", "chromium"],
+        default="edge",
+        help="Browser controlled by Playwright (default: edge).",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default=str(DEFAULT_PROFILE_DIR),
+        help="Persistent browser profile used by discovery/metadata steps.",
+    )
+    parser.add_argument(
+        "--wait-ms",
+        type=int,
+        default=4500,
+        help="Wait after opening each TikTok page (default: 4500ms).",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run browser invisibly. Visible mode is recommended first.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=1.0,
+        help="Pause between sources (default: 1 second).",
     )
 
     return parser.parse_args()
@@ -413,58 +429,114 @@ def main() -> None:
 
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
-    selected: list[dict[str, str]] = []
-
-    for row in rows:
-        if args.source_id and row.get("source_id") != args.source_id:
-            continue
-
-        output = TRANSCRIPT_DIR / f"{row.get('source_id', '')}.json"
-        if output.exists() and not args.force:
-            print(f"[SKIP] {row.get('source_id')} transcript already exists")
-            continue
-
-        selected.append(row)
-
-        if args.limit is not None and len(selected) >= args.limit:
-            break
+    selected = select_rows(
+        rows=rows,
+        source_id=args.source_id,
+        limit=args.limit,
+        force=args.force,
+    )
 
     if not selected:
         print("No sources selected.")
         return
 
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit(
+            "FFmpeg is required but was not found. Run 'ffmpeg -version'."
+        )
+
     print("=" * 72)
-    print("TikTok URL -> Transcript")
+    print("TikTok URL -> Transcript (Browser Stream)")
     print("=" * 72)
     print(f"Selected       : {len(selected)}")
-    print(f"Subtitle only  : {args.subtitle_only}")
+    print(f"Browser        : {args.browser}")
+    print(f"Headless       : {args.headless}")
     print(f"Whisper model  : {args.whisper_model}")
     print(f"Output folder  : {TRANSCRIPT_DIR}")
+
+    # Import/load Whisper only after basic environment validation.
+    import whisper
+
+    print("\n[MODEL] Loading Whisper...")
+    model = whisper.load_model(args.whisper_model)
 
     success = 0
     failed = 0
 
-    for index, row in enumerate(selected, start=1):
-        source_id = row.get("source_id", "")
-        print(f"\n[{index}/{len(selected)}] {source_id}")
-        print(f"    {row.get('url', '')}")
+    with sync_playwright() as playwright:
+        context = launch_context(
+            playwright=playwright,
+            browser_name=args.browser,
+            profile_dir=Path(args.profile_dir),
+            headless=args.headless,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(15_000)
 
-        try:
-            result = transcribe_source(
-                row=row,
-                whisper_model=args.whisper_model,
-                subtitle_only=args.subtitle_only,
-            )
-            output = save_transcript(result)
+        for index, row in enumerate(selected, start=1):
+            source_id = row.get("source_id", "")
+            source_url = row.get("url", "")
 
-            success += 1
-            print(f"    method : {result['method']}")
-            print(f"    chars  : {len(result['text'])}")
-            print(f"    saved  : {output}")
+            print(f"\n[{index}/{len(selected)}] {source_id}")
+            print(f"    {source_url}")
 
-        except Exception as exc:
-            failed += 1
-            print(f"    ERROR {type(exc).__name__}: {exc}")
+            try:
+                media_url, user_agent = collect_media_url(
+                    page=page,
+                    url=source_url,
+                    wait_ms=args.wait_ms,
+                    headless=args.headless,
+                )
+
+                print("    media  : captured from browser")
+
+                cookie_header = build_cookie_header(context, media_url)
+
+                with tempfile.TemporaryDirectory(
+                    prefix="vn_food_rag_"
+                ) as temp_dir:
+                    wav_path = Path(temp_dir) / f"{source_id}.wav"
+
+                    stream_media_to_wav(
+                        media_url=media_url,
+                        wav_path=wav_path,
+                        user_agent=user_agent,
+                        referer=source_url,
+                        cookie_header=cookie_header,
+                    )
+
+                    print(
+                        f"    audio  : temporary WAV "
+                        f"({wav_path.stat().st_size // 1024} KiB)"
+                    )
+
+                    transcript = whisper_transcribe(
+                        audio_path=wav_path,
+                        model=model,
+                    )
+
+                result = {
+                    "source_id": source_id,
+                    "url": source_url,
+                    "video_id": extract_video_id(source_url),
+                    "title": row.get("title", ""),
+                    **transcript,
+                }
+
+                output = save_transcript(result)
+
+                success += 1
+                print(f"    chars  : {len(result['text'])}")
+                print(f"    saved  : {output}")
+
+            except Exception as exc:
+                failed += 1
+                print(f"    ERROR {type(exc).__name__}: {exc}")
+
+            if args.sleep > 0:
+                time.sleep(args.sleep)
+
+        context.close()
 
     print("\n" + "=" * 72)
     print("DONE")
