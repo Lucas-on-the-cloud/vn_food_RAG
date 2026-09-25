@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import re
 import sys
 from pathlib import Path
 from urllib.parse import quote
 
-from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +21,6 @@ SOURCES_PATH = ROOT / "data" / "sources" / "video_sources.csv"
 KEYWORDS_PATH = ROOT / "data" / "sources" / "seed_keywords.csv"
 DEFAULT_PROFILE_DIR = ROOT / ".browser" / "tiktok-profile"
 
-# Keep this schema aligned with enrich_tiktok_metadata.py.
 FIELDNAMES = [
     "source_id",
     "video_id",
@@ -41,7 +46,6 @@ SOURCE_ID_RE = re.compile(r"^SRC(\d+)$")
 
 
 def canonical_video_url(url: str) -> str | None:
-    """Return a stable TikTok video URL or None if this is not a video URL."""
     if url.startswith("/"):
         url = f"https://www.tiktok.com{url}"
 
@@ -85,13 +89,13 @@ def load_source_rows() -> list[dict[str, str]]:
         return []
 
     with SOURCES_PATH.open("r", encoding="utf-8-sig", newline="") as file:
-        rows: list[dict[str, str]] = []
-        for source_row in csv.DictReader(file):
-            rows.append({
+        return [
+            {
                 field: source_row.get(field, "") or ""
                 for field in FIELDNAMES
-            })
-        return rows
+            }
+            for source_row in csv.DictReader(file)
+        ]
 
 
 def write_source_rows(rows: list[dict[str, str]]) -> None:
@@ -100,11 +104,7 @@ def write_source_rows(rows: list[dict[str, str]]) -> None:
     with SOURCES_PATH.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         writer.writeheader()
-        for row in rows:
-            writer.writerow({
-                field: row.get(field, "") or ""
-                for field in FIELDNAMES
-            })
+        writer.writerows(rows)
 
 
 def next_source_number(rows: list[dict[str, str]]) -> int:
@@ -118,21 +118,21 @@ def next_source_number(rows: list[dict[str, str]]) -> int:
     return current_max + 1
 
 
-def current_unique_count() -> int:
+def current_unique_count(rows: list[dict[str, str]] | None = None) -> int:
+    rows = load_source_rows() if rows is None else rows
     return len({
         canonical
-        for row in load_source_rows()
+        for row in rows
         if (canonical := canonical_video_url(row.get("url", "")))
     })
 
 
-def launch_context(
+async def launch_context(
     playwright: Playwright,
     browser_name: str,
     profile_dir: Path,
     headless: bool,
 ) -> BrowserContext:
-    """Launch a persistent normal browser profile."""
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     common = {
@@ -143,22 +143,24 @@ def launch_context(
     }
 
     if browser_name == "edge":
-        return playwright.chromium.launch_persistent_context(
+        return await playwright.chromium.launch_persistent_context(
             channel="msedge",
             **common,
         )
 
     if browser_name == "chrome":
-        return playwright.chromium.launch_persistent_context(
+        return await playwright.chromium.launch_persistent_context(
             channel="chrome",
             **common,
         )
 
-    return playwright.chromium.launch_persistent_context(**common)
+    return await playwright.chromium.launch_persistent_context(**common)
 
 
-def extract_visible_video_links(page: Page) -> list[dict[str, str]]:
-    raw_items = page.locator('a[href*="/video/"]').evaluate_all(
+async def extract_visible_video_links(
+    page: Page,
+) -> list[dict[str, str]]:
+    raw_items = await page.locator('a[href*="/video/"]').evaluate_all(
         """
         (elements) => elements.map((a) => ({
             href: a.href || a.getAttribute("href") || "",
@@ -187,72 +189,68 @@ def extract_visible_video_links(page: Page) -> list[dict[str, str]]:
     return results
 
 
-def crawl_keyword(
-    page: Page,
+async def crawl_keyword(
+    context: BrowserContext,
+    semaphore: asyncio.Semaphore,
     keyword: str,
     limit: int,
     max_scrolls: int,
     scroll_wait_ms: int,
-    headless: bool,
-) -> list[dict[str, str]]:
-    search_url = f"https://www.tiktok.com/search?q={quote(keyword)}"
+) -> tuple[str, list[dict[str, str]], str | None]:
+    async with semaphore:
+        page = await context.new_page()
+        search_url = f"https://www.tiktok.com/search?q={quote(keyword)}"
 
-    print(f"\n[SEARCH] {keyword}")
-    print(f"         {search_url}")
-
-    page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(3_000)
-
-    found: dict[str, dict[str, str]] = {}
-    stagnant_rounds = 0
-    previous_count = 0
-
-    for scroll_index in range(max_scrolls + 1):
-        for item in extract_visible_video_links(page):
-            found[item["url"]] = item
-
-        print(
-            f"  scroll {scroll_index:02d}/{max_scrolls}: "
-            f"{len(found)}/{limit} unique video links"
-        )
-
-        if len(found) >= limit:
-            break
-
-        if len(found) == previous_count:
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
-            previous_count = len(found)
-
-        if stagnant_rounds == 3 and not headless and len(found) == 0:
-            print(
-                "\n[NOTICE] No video links are visible yet. "
-                "If TikTok shows login/CAPTCHA/verification, complete it "
-                "in the browser window, then press ENTER here."
+        try:
+            await page.goto(
+                search_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
             )
-            try:
-                input()
-            except EOFError:
-                pass
+            await page.wait_for_timeout(3_000)
+
+            found: dict[str, dict[str, str]] = {}
             stagnant_rounds = 0
+            previous_count = 0
 
-        if stagnant_rounds >= 6:
-            print("  No new links after several scrolls; stopping this keyword.")
-            break
+            for _ in range(max_scrolls + 1):
+                for item in await extract_visible_video_links(page):
+                    found[item["url"]] = item
 
-        page.mouse.wheel(0, 5000)
-        page.wait_for_timeout(scroll_wait_ms)
+                if len(found) >= limit:
+                    break
 
-    return list(found.values())[:limit]
+                if len(found) == previous_count:
+                    stagnant_rounds += 1
+                else:
+                    stagnant_rounds = 0
+                    previous_count = len(found)
+
+                if stagnant_rounds >= 6:
+                    break
+
+                await page.mouse.wheel(0, 5000)
+                await page.wait_for_timeout(scroll_wait_ms)
+
+            return keyword, list(found.values())[:limit], None
+
+        except Exception as exc:
+            return (
+                keyword,
+                [],
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        finally:
+            await page.close()
 
 
-def save_discovered(
+def append_discovered(
+    rows: list[dict[str, str]],
     keyword: str,
     items: list[dict[str, str]],
-    max_new: int | None = None,
+    max_new: int | None,
 ) -> tuple[int, int]:
-    rows = load_source_rows()
     categories = keyword_category_map()
     category = categories.get(keyword, "unclassified")
 
@@ -299,7 +297,6 @@ def save_discovered(
         source_number += 1
         added += 1
 
-    write_source_rows(rows)
     return added, duplicates
 
 
@@ -319,72 +316,59 @@ def select_keywords(args: argparse.Namespace) -> list[str]:
     if args.max_keywords is not None:
         rows = rows[: args.max_keywords]
 
-    return [row["keyword"].strip() for row in rows if row.get("keyword")]
+    return [
+        row["keyword"].strip()
+        for row in rows
+        if row.get("keyword")
+    ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search TikTok by recipe keywords, auto-scroll results, collect "
-            "video URLs, deduplicate them, and append them to video_sources.csv."
+            "Search TikTok recipe keywords concurrently, collect video URLs, "
+            "deduplicate them, and append them safely to video_sources.csv."
         )
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--keyword",
-        help='One keyword, e.g. "món ăn sinh viên"',
-    )
-    mode.add_argument(
-        "--from-seed",
-        action="store_true",
-        help="Read keywords from data/sources/seed_keywords.csv",
-    )
+    mode.add_argument("--keyword")
+    mode.add_argument("--from-seed", action="store_true")
 
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
         "--target-new",
         type=int,
         default=None,
-        help="Stop after adding N new unique URLs in this run.",
+        help="Stop saving after N new unique URLs in this run.",
     )
     target.add_argument(
         "--target-total",
         type=int,
         default=None,
-        help="Stop when video_sources.csv reaches N unique URLs total.",
+        help="Stop saving when the CSV reaches N unique URLs total.",
     )
 
     parser.add_argument(
         "--priority",
         choices=["high", "medium", "low", "all"],
         default="high",
-        help="When using --from-seed, select seed priority (default: high)",
     )
-    parser.add_argument(
-        "--max-keywords",
-        type=int,
-        default=None,
-        help="Crawl only the first N selected seed keywords.",
-    )
+    parser.add_argument("--max-keywords", type=int, default=None)
     parser.add_argument(
         "--limit",
         type=int,
         default=30,
-        help="Maximum discovered links per keyword (default: 30).",
+        help="Maximum links collected per keyword.",
     )
     parser.add_argument(
-        "--max-scrolls",
+        "--workers",
         type=int,
-        default=30,
-        help="Maximum scroll attempts per keyword (default: 30).",
+        default=4,
+        help="Concurrent TikTok keyword pages (default: 4).",
     )
-    parser.add_argument(
-        "--scroll-wait-ms",
-        type=int,
-        default=1400,
-        help="Wait after each scroll for lazy loading (default: 1400ms).",
-    )
+    parser.add_argument("--max-scrolls", type=int, default=30)
+    parser.add_argument("--scroll-wait-ms", type=int, default=1400)
     parser.add_argument(
         "--browser",
         choices=["edge", "chrome", "chromium"],
@@ -399,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+async def async_main() -> None:
     args = parse_args()
 
     if args.limit <= 0:
@@ -409,7 +393,8 @@ def main() -> None:
     if not keywords:
         raise SystemExit("No keywords selected.")
 
-    initial_total = current_unique_count()
+    rows = load_source_rows()
+    initial_total = current_unique_count(rows)
 
     if args.target_total is not None:
         goal_new = max(0, args.target_total - initial_total)
@@ -418,50 +403,63 @@ def main() -> None:
 
     if goal_new == 0:
         print(
-            f"Already have {initial_total} unique URLs, "
-            "so the requested target is satisfied."
+            f"Already have {initial_total} unique URLs; "
+            "requested target is satisfied."
         )
         return
 
-    print("=" * 70)
-    print("TikTok Recipe URL Discovery")
-    print("=" * 70)
-    print(f"Existing URLs  : {initial_total}")
-    print(f"Keywords       : {len(keywords)}")
-    print(f"Limit/keyword  : {args.limit}")
-    print(f"Target new     : {goal_new if goal_new is not None else 'unlimited'}")
-    print(f"Browser        : {args.browser}")
-    print(f"Headless       : {args.headless}")
-    print(f"Output         : {SOURCES_PATH}")
+    workers = max(1, min(args.workers, len(keywords)))
+    semaphore = asyncio.Semaphore(workers)
+
+    print("=" * 72)
+    print("TikTok Recipe URL Discovery - Parallel Keyword Mode")
+    print("=" * 72)
+    print(f"Existing URLs : {initial_total}")
+    print(f"Keywords      : {len(keywords)}")
+    print(f"Workers       : {workers}")
+    print(f"Limit/keyword : {args.limit}")
+    print(
+        f"Target new    : "
+        f"{goal_new if goal_new is not None else 'unlimited'}"
+    )
 
     total_found = 0
     total_added = 0
     total_duplicates = 0
+    failed_keywords = 0
 
     try:
-        with sync_playwright() as playwright:
-            context = launch_context(
+        async with async_playwright() as playwright:
+            context = await launch_context(
                 playwright=playwright,
                 browser_name=args.browser,
                 profile_dir=Path(args.profile_dir),
                 headless=args.headless,
             )
 
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(15_000)
-
-            for keyword in keywords:
-                if goal_new is not None and total_added >= goal_new:
-                    break
-
-                items = crawl_keyword(
-                    page=page,
-                    keyword=keyword,
-                    limit=args.limit,
-                    max_scrolls=args.max_scrolls,
-                    scroll_wait_ms=args.scroll_wait_ms,
-                    headless=args.headless,
+            tasks = [
+                asyncio.create_task(
+                    crawl_keyword(
+                        context=context,
+                        semaphore=semaphore,
+                        keyword=keyword,
+                        limit=args.limit,
+                        max_scrolls=args.max_scrolls,
+                        scroll_wait_ms=args.scroll_wait_ms,
+                    )
                 )
+                for keyword in keywords
+            ]
+
+            for task in asyncio.as_completed(tasks):
+                keyword, items, error = await task
+
+                if error:
+                    failed_keywords += 1
+                    print(
+                        f"[ERROR] {keyword!r}: {error}"
+                    )
+                    continue
 
                 remaining = (
                     None
@@ -469,9 +467,10 @@ def main() -> None:
                     else max(0, goal_new - total_added)
                 )
 
-                added, duplicates = save_discovered(
-                    keyword,
-                    items,
+                added, duplicates = append_discovered(
+                    rows=rows,
+                    keyword=keyword,
+                    items=items,
                     max_new=remaining,
                 )
 
@@ -479,36 +478,48 @@ def main() -> None:
                 total_added += added
                 total_duplicates += duplicates
 
+                # Only this main event-loop task writes the shared CSV.
+                write_source_rows(rows)
+
                 print(
-                    f"[SAVED] keyword={keyword!r} "
-                    f"found={len(items)} new={added} "
-                    f"duplicates={duplicates} total_new={total_added}"
+                    f"[SAVED] {keyword!r} "
+                    f"found={len(items)} "
+                    f"new={added} dup={duplicates} "
+                    f"total_new={total_added}"
                 )
 
-            context.close()
+            await context.close()
 
     except Exception as exc:
-        print(f"\n[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"\n[ERROR] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         raise SystemExit(1) from exc
 
-    final_total = current_unique_count()
+    final_total = current_unique_count(rows)
 
-    print("\n" + "=" * 70)
+    print()
+    print("=" * 72)
     print("DONE")
-    print(f"Collected this run : {total_found}")
-    print(f"New URLs saved     : {total_added}")
-    print(f"Duplicates skipped : {total_duplicates}")
-    print(f"Total unique URLs  : {final_total}")
-    print(f"CSV                : {SOURCES_PATH}")
+    print(f"Links observed      : {total_found}")
+    print(f"New URLs saved      : {total_added}")
+    print(f"Duplicates skipped  : {total_duplicates}")
+    print(f"Failed keywords     : {failed_keywords}")
+    print(f"Total unique URLs   : {final_total}")
+    print(f"CSV                 : {SOURCES_PATH}")
 
     if goal_new is not None and total_added < goal_new:
         print(
-            f"NOTE: target was not fully reached; "
-            f"{goal_new - total_added} more new URLs are needed. "
-            "Run again or include medium-priority seed keywords."
+            f"NOTE: {goal_new - total_added} additional new URLs are "
+            "still needed. Run again or widen keyword priority."
         )
 
-    print("=" * 70)
+    print("=" * 72)
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
