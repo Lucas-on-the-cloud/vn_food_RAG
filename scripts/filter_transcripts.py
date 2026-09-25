@@ -10,15 +10,23 @@ from pathlib import Path
 DEFAULT_MIN_WORDS = 80
 DEFAULT_MAX_REPEAT5 = 0.55
 
+# Terms used only as a coarse "does this sound like cooking?" signal.
+# Avoid very ambiguous Vietnamese words such as "toi" (tôi/tỏi),
+# "nam" (nắm/nấm), and "hanh" because accent stripping would create
+# many false positives.
 RECIPE_TERMS = {
-    "nau", "mon", "com", "canh", "xao", "chien", "kho", "rim", "luoc",
-    "hap", "nuong", "thit", "trung", "dau hu", "nam", "rau", "hanh",
-    "toi", "nuoc mam", "nuoc tuong", "dau hao", "bot nang", "bot bap",
+    "nau", "mon", "com", "canh", "xao", "chien", "rim", "luoc",
+    "hap", "nuong", "thit", "trung", "dau hu", "rau",
+    "nuoc mam", "nuoc tuong", "dau hao", "bot nang", "bot bap",
     "ap chao", "gia vi", "nguyen lieu",
 }
 
 JUNK_TERMS = {
     "subscribe", "dang ky kenh", "khong bo lo", "official audio",
+}
+
+MUSIC_TERMS = {
+    "baby", "love", "lover", "yeah", "oh",
 }
 
 
@@ -55,9 +63,14 @@ def single_token_dominance(text: str) -> float:
     return max(counts.values()) / len(words)
 
 
+def contains_term(value: str, term: str) -> bool:
+    pattern = r"(?<!\\w)" + re.escape(term) + r"(?!\\w)"
+    return re.search(pattern, value) is not None
+
+
 def recipe_term_hits(text: str) -> int:
     value = normalize(text)
-    return sum(term in value for term in RECIPE_TERMS)
+    return sum(contains_term(value, term) for term in RECIPE_TERMS)
 
 
 def classify(text: str) -> tuple[str, str, dict[str, float | int]]:
@@ -84,8 +97,15 @@ def classify(text: str) -> tuple[str, str, dict[str, float | int]]:
     if dominance >= 0.30:
         return "rejected", "token_hallucination", metrics
 
-    if any(term in normalized for term in JUNK_TERMS) and hits < 2:
+    if any(contains_term(normalized, term) for term in JUNK_TERMS) and hits < 2:
         return "rejected", "junk_or_subscription", metrics
+
+    music_hits = sum(
+        contains_term(normalized, term)
+        for term in MUSIC_TERMS
+    )
+    if music_hits >= 2 and hits < 2:
+        return "rejected", "music_or_non_recipe", metrics
 
     if word_count < DEFAULT_MIN_WORDS and hits < 3:
         return "rejected", "low_recipe_signal", metrics
