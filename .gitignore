@@ -24,6 +24,11 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+
+# Raw external transcript files stay local
+data/transcripts/raw/*
+!data/transcripts/raw/.gitkeep
+
 dataset/ingredients/images/
 dataset/ingredients/annotations/*
 !dataset/ingredients/annotations/.gitkeep
@@ -48,6 +53,7 @@ experiments/**/artifacts/
 *.wav
 *.mp3
 *.m4a
+*.flac
 
 # Secrets
 *.key
