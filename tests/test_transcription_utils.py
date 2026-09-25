@@ -1,54 +1,50 @@
 from scripts.transcribe_tiktok_sources import (
-    choose_subtitle_track,
-    clean_subtitle_text,
-    language_rank,
-    parse_json_subtitle,
+    choose_media_url,
+    extract_video_id,
+    is_http_media_url,
+    looks_like_media,
 )
 
 
-def test_clean_vtt_text():
-    raw = """WEBVTT
+def test_extract_video_id():
+    assert extract_video_id(
+        "https://www.tiktok.com/@abc/video/1234567890"
+    ) == "1234567890"
 
-00:00:00.000 --> 00:00:02.000
-Hôm nay mình nấu cơm.
 
-00:00:02.000 --> 00:00:04.000
-Cho trứng vào chảo.
-"""
+def test_http_media_detection():
+    assert is_http_media_url("https://v16.tiktokcdn.com/video/test.mp4")
+    assert not is_http_media_url("blob:https://www.tiktok.com/abc")
 
-    assert clean_subtitle_text(raw) == (
-        "Hôm nay mình nấu cơm. Cho trứng vào chảo."
+
+def test_looks_like_video_response():
+    assert looks_like_media(
+        "https://example.com/file",
+        "video/mp4",
     )
 
 
-def test_choose_vietnamese_subtitle():
-    info = {
-        "subtitles": {
-            "en": [{"ext": "vtt", "data": "English"}],
-            "vi-VN": [{"ext": "vtt", "data": "Tiếng Việt"}],
+def test_current_src_is_preferred():
+    current = "https://v16.tiktokcdn.com/video/current.mp4"
+    captured = [
+        {
+            "url": "https://v16.tiktokcdn.com/video/other.mp4",
+            "content_type": "video/mp4",
         }
-    }
+    ]
 
-    language, track = choose_subtitle_track(info)
-
-    assert language == "vi-VN"
-    assert track["data"] == "Tiếng Việt"
+    assert choose_media_url(current, captured) == current
 
 
-def test_language_rank_prefers_vi():
-    assert language_rank("vi-VN") > language_rank("en")
+def test_blob_src_falls_back_to_captured_video():
+    captured_url = "https://v16.tiktokcdn.com/video/stream.mp4"
 
-
-def test_parse_json_caption():
-    raw = """{
-      "utterances": [
-        {"start_time": 0, "end_time": 1500, "text": "Xin chào"},
-        {"start_time": 1500, "end_time": 3000, "text": "Hôm nay mình nấu ăn"}
-      ]
-    }"""
-
-    text, segments = parse_json_subtitle(raw)
-
-    assert text == "Xin chào Hôm nay mình nấu ăn"
-    assert len(segments) == 2
-    assert segments[1]["start"] == 1.5
+    assert choose_media_url(
+        "blob:https://www.tiktok.com/abc",
+        [
+            {
+                "url": captured_url,
+                "content_type": "video/mp4",
+            }
+        ],
+    ) == captured_url
