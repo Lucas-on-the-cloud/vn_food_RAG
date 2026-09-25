@@ -1,0 +1,11 @@
+weights:
+  ingredient_match: 0.50
+  cooking_time: 0.15
+  cost: 0.15
+  difficulty: 0.10
+  user_preference: 0.10
+
+defaults:
+  max_cooking_time_minutes: 30
+  max_budget_twd: 120
+  difficulty: beginner
