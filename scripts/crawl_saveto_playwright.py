@@ -48,6 +48,10 @@ class SavetoBrowserError(RuntimeError):
     pass
 
 
+class SavetoLoginRequiredError(SavetoBrowserError):
+    pass
+
+
 def extract_completed_transcript(body: dict[str, Any]) -> dict[str, Any] | None:
     """Return completed transcript payload from a Saveto status response."""
     if int(body.get("code", 0) or 0) != 200:
@@ -88,6 +92,18 @@ def extract_completed_transcript(body: dict[str, Any]) -> dict[str, Any] | None:
 
 def response_error(body: dict[str, Any]) -> str | None:
     """Extract an explicit Saveto API error from a frontend network response."""
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        code = int(detail.get("code", 0) or 0)
+        message = (
+            detail.get("message")
+            or detail.get("msg")
+            or detail.get("error")
+            or "unknown Saveto error"
+        )
+        if code:
+            return f"code={code}: {message}"
+
     code = int(body.get("code", 0) or 0)
     if code in {0, 200}:
         return None
@@ -230,13 +246,37 @@ async def submit_and_capture(
                 raw_body = ""
 
             request_body = response.request.post_data or ""
+
+            try:
+                parsed_error = json.loads(raw_body)
+            except Exception:
+                parsed_error = None
+
+            nested_error = (
+                response_error(parsed_error)
+                if isinstance(parsed_error, dict)
+                else None
+            )
+
             detail = (
                 f"HTTP {response.status} from {response.url}; "
                 f"response={raw_body[:800]!r}; "
                 f"request={request_body[:800]!r}"
             )
+
+            exc: Exception
+            if nested_error and "code=648:" in nested_error:
+                exc = SavetoLoginRequiredError(
+                    "Saveto guest daily limit reached. "
+                    "Log in using the persistent Playwright profile before "
+                    "continuing the batch. "
+                    + detail
+                )
+            else:
+                exc = SavetoBrowserError(detail)
+
             if not result_future.done():
-                result_future.set_exception(SavetoBrowserError(detail))
+                result_future.set_exception(exc)
             return
 
         if not isinstance(body, dict):
@@ -340,11 +380,20 @@ async def process_one(
     submit_state: dict[str, float],
     submit_gap_seconds: float,
     retries: int,
+    stop_event: asyncio.Event,
 ) -> dict[str, str]:
     source_id = row.get("source_id", "")
     url = row.get("url", "")
     txt_path = RAW_DIR / f"{source_id}.txt"
     json_path = JSON_DIR / f"{source_id}.json"
+
+    if stop_event.is_set():
+        return {
+            "source_id": source_id,
+            "url": url,
+            "status": "stopped_login_required",
+            "detail": "Batch stopped because Saveto requires login.",
+        }
 
     if txt_path.exists() and json_path.exists() and not force:
         return {
@@ -358,6 +407,14 @@ async def process_one(
         last_error = ""
 
         for attempt in range(retries + 1):
+            if stop_event.is_set():
+                return {
+                    "source_id": source_id,
+                    "url": url,
+                    "status": "stopped_login_required",
+                    "detail": "Batch stopped because Saveto requires login.",
+                }
+
             page = await context.new_page()
 
             try:
@@ -379,6 +436,15 @@ async def process_one(
                     "detail": (
                         f"{len(result.get('text', ''))} chars -> {txt_path}"
                     ),
+                }
+
+            except SavetoLoginRequiredError as exc:
+                stop_event.set()
+                return {
+                    "source_id": source_id,
+                    "url": url,
+                    "status": "login_required",
+                    "detail": str(exc),
                 }
 
             except Exception as exc:
@@ -478,6 +544,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite transcripts that already exist.",
     )
+    parser.add_argument(
+        "--login-only",
+        action="store_true",
+        help=(
+            "Open Saveto using the persistent browser profile, let you log in "
+            "manually, then press ENTER in the terminal to save the session."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -496,6 +570,29 @@ async def async_main() -> None:
     if args.limit is not None:
         rows = rows[: args.limit]
 
+    if args.login_only:
+        async with async_playwright() as playwright:
+            context = await launch_context(
+                playwright=playwright,
+                browser_name=args.browser,
+                profile_dir=Path(args.profile_dir),
+                headless=False,
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto(
+                SAVETO_URL,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            print()
+            print("Saveto opened with the persistent Playwright profile.")
+            print("Log in normally in the browser window.")
+            print("After you confirm you are logged in, return here and press ENTER.")
+            await asyncio.to_thread(input)
+            await context.close()
+        print("Login session saved in:", args.profile_dir)
+        return
+
     if not rows:
         print("No sources selected.")
         return
@@ -504,6 +601,7 @@ async def async_main() -> None:
     semaphore = asyncio.Semaphore(workers)
     submit_gate = asyncio.Lock()
     submit_state: dict[str, float] = {"last_submit": 0.0}
+    stop_event = asyncio.Event()
 
     print("=" * 72)
     print("Saveto Playwright Transcript Batch")
@@ -536,6 +634,7 @@ async def async_main() -> None:
                     submit_state=submit_state,
                     submit_gap_seconds=args.submit_gap,
                     retries=args.retries,
+                    stop_event=stop_event,
                 )
             )
             for row in rows
@@ -571,6 +670,10 @@ async def async_main() -> None:
         for item in results
     )
     failed = sum(item["status"] == "failed" for item in results)
+    login_required = sum(
+        item["status"] in {"login_required", "stopped_login_required"}
+        for item in results
+    )
 
     print()
     print("=" * 72)
@@ -578,6 +681,7 @@ async def async_main() -> None:
     print(f"Success : {success}")
     print(f"Skipped : {skipped}")
     print(f"Failed  : {failed}")
+    print(f"Login/stopped : {login_required}")
     print(f"TXT     : {RAW_DIR}")
     print(f"JSON    : {JSON_DIR}")
     print(f"Report  : {REPORT_PATH}")
