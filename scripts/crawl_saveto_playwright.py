@@ -13,7 +13,7 @@ from playwright.async_api import BrowserContext, Page, Playwright, async_playwri
 
 ROOT = Path(__file__).resolve().parents[1]
 SAVETO_URL = "https://saveto.ai/tiktok-transcript-generator/"
-DEFAULT_MANIFEST = ROOT / "data" / "transcripts" / "saveto_batch_10.csv"
+DEFAULT_MANIFEST = ROOT / "data" / "transcripts" / "saveto_batch.csv"
 RAW_DIR = ROOT / "data" / "transcripts" / "raw"
 JSON_DIR = ROOT / "data" / "transcripts" / "json"
 REPORT_PATH = ROOT / "data" / "processed" / "saveto" / "acquisition_report.csv"
@@ -380,7 +380,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=10,
+        default=None,
+        help="Process all manifest rows by default.",
     )
     parser.add_argument(
         "--workers",
@@ -428,7 +429,8 @@ async def async_main() -> None:
     ) as file:
         rows = list(csv.DictReader(file))
 
-    rows = rows[: args.limit]
+    if args.limit is not None:
+        rows = rows[: args.limit]
 
     if not rows:
         print("No sources selected.")
