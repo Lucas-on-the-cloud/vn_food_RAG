@@ -37,6 +37,11 @@ BUTTON_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+SUBMIT_SELECTORS = (
+    "#app > div > div > div:nth-child(2) > button",
+    "button[type='submit']",
+)
+
 
 class SavetoBrowserError(RuntimeError):
     pass
@@ -158,6 +163,19 @@ async def find_url_input(page: Page):
 
 
 async def click_generate(page: Page, url_input) -> None:
+    # Prefer the exact selector observed in the current Saveto UI.
+    for selector in SUBMIT_SELECTORS:
+        button = await first_visible(page.locator(selector))
+        if button is None:
+            continue
+
+        try:
+            await button.click(timeout=5_000)
+            return
+        except Exception:
+            continue
+
+    # Fall back to semantic button matching if the DOM layout changes.
     candidates = [
         page.get_by_role("button", name=BUTTON_TEXT_RE),
         page.locator("button").filter(has_text=BUTTON_TEXT_RE),
@@ -174,7 +192,7 @@ async def click_generate(page: Page, url_input) -> None:
         except Exception:
             continue
 
-    # Some layouts submit on Enter.
+    # Final fallback: some layouts submit on Enter.
     await url_input.press("Enter")
 
 
