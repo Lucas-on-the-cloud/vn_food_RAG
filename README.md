@@ -1,164 +1,175 @@
-# VN Food RAG 🇻🇳🍳🇹🇼
+# VietPantry-TW
 
-A multimodal AI project for Vietnamese students in Taiwan: recognize available ingredients, retrieve suitable Vietnamese recipes, and recommend affordable, beginner-friendly meals.
+A Vietnamese student-food recommendation project for people living in Taiwan.
 
-## Motivation
+The project combines:
 
-Many students living abroad have limited cooking experience and often face a simple question:
+- TikTok recipe discovery
+- external transcript generation
+- transcript quality filtering
+- structured recipe extraction
+- ingredient normalization
+- ingredient-image recognition
+- recipe retrieval and RAG recommendation
 
-> "I have these ingredients. What Vietnamese dishes can I cook?"
-
-This project turns Vietnamese short-form cooking content into a structured recipe knowledge base and combines it with a Taiwan ingredient dataset.
-
-The system is designed around **retrieval and recommendation**, not blindly fine-tuning a language model on 1,000 recipes.
-
-## Core Idea
+## Current Architecture
 
 ```text
-Vietnamese cooking videos
+TikTok keyword search
         |
         v
-Speech / text extraction
+video_sources.csv
         |
         v
-Structured recipe dataset
+Saveto TikTok Transcript Generator
+(manual/external transcription provider)
         |
-        +--------------------+
-                             |
-Taiwan ingredient images    |
-        |                    |
-        v                    |
-Ingredient recognition      |
-        |                    |
-        +---------> Recipe retrieval
-                             |
-                             v
-                    Ranking / filtering
-                             |
-                             v
-                    RAG cooking assistant
+        v
+SRCxxxx.txt
+        |
+        v
+parallel transcript quality gate
+        |
+        +---- rejected / missing / junk
+        |
+        v
+accepted transcripts
+        |
+        v
+structured recipe extraction
+        |
+        v
+recipe knowledge base
+        |
+        +-------------------------+
+                                  |
+Taiwan ingredient images         |
+        |                         |
+        v                         |
+ingredient recognition           |
+        |                         |
+        +------ recipe retrieval -+
+                    |
+                    v
+              RAG assistant
 ```
 
-## Main Components
+## Why Saveto is now the primary transcription path
 
-### 1. Vietnamese Recipe Dataset
+Local Whisper/Kaggle transcription worked, but it added a large amount of engineering overhead around TikTok media extraction, FFmpeg, GPU inference and noisy speech.
 
-Target: approximately **1,000 student-friendly Vietnamese recipes**.
+For this project, transcript generation is infrastructure rather than the research contribution. The main research value is in:
 
-Each recipe is normalized into structured fields such as:
+1. building a Vietnamese student-recipe knowledge base,
+2. recognizing ingredients available in Taiwan,
+3. retrieving recipes from available ingredients,
+4. evaluating recommendation quality.
+
+Saveto is therefore treated as an **external transcript provider**.
+
+The repository does not automate Saveto itself. Raw transcripts are copied/downloaded from Saveto and then processed locally.
+
+## Phase 1 — First 10 Videos
+
+The first experiment uses:
+
+`data/transcripts/saveto_batch_10.csv`
+
+Workflow:
+
+### 1. Pull the repository
+
+```powershell
+git pull origin main
+pip install -r requirements.txt
+```
+
+### 2. Generate/reset a 10-video batch if needed
+
+```powershell
+python scripts/prepare_saveto_batch.py --limit 10
+```
+
+### 3. Generate transcripts with Saveto
+
+Open the TikTok transcript generator and process each URL from the manifest.
+
+Save/copy each transcript as:
+
+```text
+data/transcripts/raw/
+  SRC0001.txt
+  SRC0002.txt
+  ...
+  SRC0010.txt
+```
+
+If a TikTok video cannot load, contains no useful speech, or produces a bad transcript, simply skip it.
+
+### 4. Process all available transcripts in parallel
+
+```powershell
+python scripts/process_saveto_batch.py --workers 10
+```
+
+Output:
+
+```text
+data/processed/saveto/
+  transcripts_review.csv
+  transcripts_accepted.csv
+  transcripts_rejected.csv
+```
+
+Missing files are logged and skipped automatically.
+
+## Scaling Philosophy
+
+The pipeline is **best effort**.
+
+For 100–200+ source videos, individual failures are expected:
+
+```text
+200 discovered videos
+       |
+       +-- media/transcript failures -> skip
+       +-- music/no speech            -> skip
+       +-- non-recipe content         -> skip
+       |
+       v
+clean usable recipe transcripts
+```
+
+The goal is not 100% extraction yield. The goal is a sufficiently large, clean recipe dataset.
+
+## Recipe Schema
+
+See:
+
+`dataset/recipes/recipe_schema.json`
+
+Main fields include:
 
 - dish name
+- source URL
 - ingredients
 - quantities
 - cooking steps
 - cooking time
 - difficulty
+- estimated cost in TWD
 - equipment
-- estimated cost
-- source metadata
+- tags
 
-### 2. Taiwan Ingredient Dataset
+## Ingredient Dataset
 
-A custom dataset of ingredients commonly available to students in Taiwan.
+The starter ingredient mapping is:
 
-Initial MVP target:
+`dataset/ingredients/ingredient_mapping.csv`
 
-- 20-30 ingredient classes
-- Vietnamese / Traditional Chinese / English labels
-- locally collected images
-- supermarket and traditional market packaging variations
+It contains Vietnamese, Traditional Chinese and English names for common ingredients available in Taiwan.
 
-Example classes:
-
-- pork belly / 五花肉 / thịt ba chỉ
-- egg / 雞蛋 / trứng
-- tofu / 豆腐 / đậu phụ
-- water spinach / 空心菜 / rau muống
-- bok choy / 青江菜 / cải thìa
-
-### 3. Ingredient Recognition
-
-Initial baseline:
-
-```text
-Image -> classifier -> ingredient label
-```
-
-Later:
-
-```text
-Pantry / refrigerator image
-        |
-        v
-Object detector
-        |
-        v
-Multiple ingredient labels
-```
-
-### 4. Recipe Retrieval
-
-Recognized ingredients are matched against the recipe knowledge base.
-
-Example:
-
-```text
-User ingredients:
-- egg
-- pork belly
-- tofu
-
-        |
-        v
-
-Retrieve candidate recipes
-
-        |
-        v
-
-Rank by:
-- ingredient coverage
-- missing ingredients
-- cost
-- cooking time
-- difficulty
-```
-
-### 5. RAG Cooking Assistant
-
-The language model receives retrieved recipes as context instead of inventing recipes from scratch.
-
-Example query:
-
-> I have pork belly, eggs and tofu. My budget is NT$100 and I only have 30 minutes.
-
-The assistant retrieves relevant recipes and explains the best matching options.
-
-## MVP Scope
-
-The first usable version will contain:
-
-- [ ] 100 structured Vietnamese recipes
-- [ ] 20 Taiwan ingredient classes
-- [ ] baseline ingredient image classifier
-- [ ] recipe retrieval
-- [ ] recommendation scoring
-- [ ] simple web interface
-
-After the MVP:
-
-- [ ] scale to 500 recipes
-- [ ] scale to 1,000 recipes
-- [ ] expand to 50-100 ingredient classes
-- [ ] upgrade classification to object detection
-- [ ] add vector search
-- [ ] add RAG cooking assistant
-- [ ] add cost-aware recommendation
-- [ ] add user preference learning
-
-## Proposed Recommendation Score
-
-A first baseline can use:
+## Recommendation Baseline
 
 ```text
 score =
@@ -169,78 +180,36 @@ score =
   + 0.10 * user_preference_score
 ```
 
-The weighting will later be evaluated experimentally.
-
 ## Repository Structure
 
 ```text
-vn_food_RAG/
-├── configs/
-├── data/
-│   ├── raw/
-│   ├── processed/
-│   └── samples/
-├── dataset/
-│   ├── recipes/
-│   └── ingredients/
-├── docs/
-├── experiments/
-├── notebooks/
-├── src/
-│   ├── collection/
-│   ├── transcription/
-│   ├── recipe_extraction/
-│   ├── vision/
-│   ├── retrieval/
-│   ├── recommendation/
-│   └── utils/
-├── tests/
-├── .gitignore
-├── requirements.txt
-└── README.md
+configs/
+data/
+  samples/
+  sources/
+  transcripts/
+dataset/
+  ingredients/
+  recipes/
+docs/
+scripts/
+src/
+  recipe_extraction/
+  recommendation/
+  retrieval/
+tests/
 ```
 
-## Development Phases
+## Current Status
 
-### Phase 1 — Recipe Knowledge Base
-1. Define recipe schema.
-2. Collect an initial set of recipes.
-3. Extract transcript / text.
-4. Convert unstructured content to structured JSON.
-5. Normalize ingredient names.
-
-### Phase 2 — Taiwan Ingredient Dataset
-1. Define ingredient taxonomy.
-2. Create multilingual labels.
-3. Collect local images.
-4. Annotate and split the dataset.
-
-### Phase 3 — Ingredient Recognition
-1. Train a classification baseline.
-2. Evaluate class accuracy.
-3. Upgrade to multi-object detection when enough data is available.
-
-### Phase 4 — Retrieval & Recommendation
-1. Ingredient matching baseline.
-2. Missing-ingredient calculation.
-3. Cost/time/difficulty filters.
-4. Embedding/vector retrieval.
-5. Ranking experiments.
-
-### Phase 5 — RAG Assistant
-1. Retrieve recipes.
-2. Inject retrieved evidence into the prompt.
-3. Generate beginner-friendly cooking instructions.
-4. Evaluate grounding and recommendation quality.
-
-## Data Note
-
-Raw videos, large image datasets, model weights, vector indexes and secrets should **not** be committed directly to Git.
-
-Only schemas, small samples, metadata and reproducible scripts belong in the repository.
-
-## Status
-
-**Stage:** Project initialization / dataset design.
-
-The current priority is building a small, clean MVP before scaling to 1,000 recipes.
+- [x] TikTok keyword crawler
+- [x] first 10 TikTok sources
+- [x] TikTok metadata enrichment
+- [x] Saveto-first transcription architecture
+- [x] parallel transcript quality processing
+- [ ] validate first 10 Saveto transcripts
+- [ ] structured recipe extraction
+- [ ] scale recipe collection to 100–200+ videos
+- [ ] ingredient vision dataset
+- [ ] ingredient recognition baseline
+- [ ] vector retrieval / RAG
