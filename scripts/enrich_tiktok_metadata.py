@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import re
-import time
 import unicodedata
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,57 +41,28 @@ FIELDNAMES = [
 VIDEO_ID_RE = re.compile(r"/video/(\d+)")
 
 STRONG_RECIPE_TERMS = {
-    "cach lam",
-    "cong thuc",
-    "nguyen lieu",
-    "nau",
-    "mon",
-    "com",
-    "canh",
-    "xao",
-    "kho",
-    "chien",
-    "rim",
-    "luoc",
-    "hap",
-    "nuong",
-    "sot",
-    "gia vi",
-    "recipe",
+    "cach lam", "cong thuc", "nguyen lieu", "nau", "mon", "com",
+    "canh", "xao", "kho", "chien", "rim", "luoc", "hap", "nuong",
+    "sot", "gia vi", "recipe",
 }
 
 STUDENT_FRIENDLY_TERMS = {
-    "sinh vien",
-    "tiet kiem",
-    "de lam",
-    "don gian",
-    "nhanh",
-    "15 phut",
-    "20 phut",
-    "30 phut",
-    "duoi 50k",
-    "50k",
-    "noi com dien",
-    "mot chao",
-    "1 chao",
-    "it nguyen lieu",
+    "sinh vien", "tiet kiem", "de lam", "don gian", "nhanh",
+    "15 phut", "20 phut", "30 phut", "duoi 50k", "50k",
+    "noi com dien", "mot chao", "1 chao", "it nguyen lieu",
 }
 
 NEGATIVE_TERMS = {
-    "mukbang",
-    "food tour",
-    "buffet",
-    "review quan",
-    "review nha hang",
-    "an thu",
-    "challenge",
+    "mukbang", "food tour", "buffet", "review quan",
+    "review nha hang", "an thu", "challenge",
 }
 
 
 def strip_accents(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text)
     without_marks = "".join(
-        char for char in normalized if unicodedata.category(char) != "Mn"
+        char for char in normalized
+        if unicodedata.category(char) != "Mn"
     )
     return without_marks.replace("đ", "d").replace("Đ", "D").lower()
 
@@ -97,8 +73,6 @@ def extract_video_id(url: str) -> str:
 
 
 def score_relevance(title: str, keyword: str = "") -> tuple[int, str]:
-    """Simple, interpretable recipe-relevance baseline."""
-
     text = strip_accents(f"{title} {keyword}")
     score = 0
 
@@ -124,13 +98,13 @@ def score_relevance(title: str, keyword: str = "") -> tuple[int, str]:
 def load_rows() -> list[dict[str, str]]:
     with SOURCES_PATH.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
-        rows = []
-
-        for source_row in reader:
-            row = {field: source_row.get(field, "") or "" for field in FIELDNAMES}
-            rows.append(row)
-
-        return rows
+        return [
+            {
+                field: source_row.get(field, "") or ""
+                for field in FIELDNAMES
+            }
+            for source_row in reader
+        ]
 
 
 def write_rows(rows: list[dict[str, str]]) -> None:
@@ -151,7 +125,7 @@ def append_note(existing: str, new_note: str) -> str:
     return ";".join(parts)
 
 
-def launch_context(
+async def launch_context(
     playwright: Playwright,
     browser_name: str,
     profile_dir: Path,
@@ -167,41 +141,41 @@ def launch_context(
     }
 
     if browser_name == "edge":
-        return playwright.chromium.launch_persistent_context(
+        return await playwright.chromium.launch_persistent_context(
             channel="msedge",
             **common,
         )
 
     if browser_name == "chrome":
-        return playwright.chromium.launch_persistent_context(
+        return await playwright.chromium.launch_persistent_context(
             channel="chrome",
             **common,
         )
 
-    return playwright.chromium.launch_persistent_context(**common)
+    return await playwright.chromium.launch_persistent_context(**common)
 
 
-def first_meta(page: Page, *selectors: str) -> str:
+async def first_meta(page: Page, *selectors: str) -> str:
     for selector in selectors:
         locator = page.locator(selector)
-        if locator.count() == 0:
+        if await locator.count() == 0:
             continue
 
-        value = locator.first.get_attribute("content")
+        value = await locator.first.get_attribute("content")
         if value and value.strip():
             return value.strip()
 
     return ""
 
 
-def first_text(page: Page, *selectors: str) -> str:
+async def first_text(page: Page, *selectors: str) -> str:
     for selector in selectors:
         locator = page.locator(selector)
-        if locator.count() == 0:
+        if await locator.count() == 0:
             continue
 
         try:
-            value = locator.first.inner_text(timeout=2000).strip()
+            value = (await locator.first.inner_text(timeout=2000)).strip()
         except Exception:
             continue
 
@@ -212,8 +186,6 @@ def first_text(page: Page, *selectors: str) -> str:
 
 
 def find_video_object(node: Any, video_id: str) -> dict[str, Any] | None:
-    """Recursively locate a TikTok video object in hydration JSON."""
-
     if isinstance(node, dict):
         node_id = str(node.get("id", ""))
         if node_id == video_id and (
@@ -235,15 +207,18 @@ def find_video_object(node: Any, video_id: str) -> dict[str, Any] | None:
     return None
 
 
-def extract_hydration_metadata(page: Page, video_id: str) -> dict[str, str]:
+async def extract_hydration_metadata(
+    page: Page,
+    video_id: str,
+) -> dict[str, str]:
     locator = page.locator("script#__UNIVERSAL_DATA_FOR_REHYDRATION__")
-    if locator.count() == 0:
+    if await locator.count() == 0:
         return {}
 
     try:
-        raw = locator.first.text_content(timeout=3000) or ""
+        raw = await locator.first.text_content(timeout=3000) or ""
         payload = json.loads(raw)
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         return {}
 
     item = find_video_object(payload, video_id)
@@ -278,48 +253,45 @@ def extract_hydration_metadata(page: Page, video_id: str) -> dict[str, str]:
     }
 
 
-def extract_browser_metadata(page: Page, video_id: str) -> dict[str, str]:
-    """Extract metadata from the normal TikTok video webpage.
-
-    Order:
-    1. TikTok hydration JSON when available.
-    2. Visible DOM.
-    3. OpenGraph/meta tags.
-    """
-
-    hydration = extract_hydration_metadata(page, video_id)
+async def extract_browser_metadata(
+    page: Page,
+    video_id: str,
+) -> dict[str, str]:
+    hydration = await extract_hydration_metadata(page, video_id)
 
     title = hydration.get("title", "")
     author_name = hydration.get("author_name", "")
     thumbnail_url = hydration.get("thumbnail_url", "")
 
     if not title:
-        title = first_text(
+        title = await first_text(
             page,
             '[data-e2e="browse-video-desc"]',
             'h1[data-e2e="browse-video-desc"]',
         )
 
     if not author_name:
-        author_name = first_text(
+        author_name = await first_text(
             page,
             '[data-e2e="browse-username"]',
             '[data-e2e="browse-user-name"]',
         )
 
     if not title:
-        title = first_meta(
+        title = await first_meta(
             page,
             'meta[property="og:description"]',
             'meta[name="description"]',
         )
 
     if not author_name:
-        og_title = first_meta(page, 'meta[property="og:title"]')
-        author_name = og_title
+        author_name = await first_meta(
+            page,
+            'meta[property="og:title"]',
+        )
 
     if not thumbnail_url:
-        thumbnail_url = first_meta(
+        thumbnail_url = await first_meta(
             page,
             'meta[property="og:image"]',
             'meta[name="twitter:image"]',
@@ -332,54 +304,75 @@ def extract_browser_metadata(page: Page, video_id: str) -> dict[str, str]:
     }
 
 
-def enrich_row_with_browser(
-    page: Page,
+async def enrich_one(
+    context: BrowserContext,
+    semaphore: asyncio.Semaphore,
+    index: int,
     row: dict[str, str],
     wait_ms: int,
-    headless: bool,
-) -> dict[str, str]:
-    video_id = extract_video_id(row["url"])
-    row["video_id"] = video_id
+) -> tuple[int, dict[str, str], str]:
+    async with semaphore:
+        page = await context.new_page()
+        source_id = row["source_id"]
 
-    page.goto(row["url"], wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(wait_ms)
-
-    metadata = extract_browser_metadata(page, video_id)
-
-    if not metadata["title"] and not headless:
-        print(
-            "    No metadata found. If TikTok is showing login/CAPTCHA/"
-            "verification, complete it in the browser, then press ENTER."
-        )
         try:
-            input()
-        except EOFError:
-            pass
+            video_id = extract_video_id(row["url"])
+            row["video_id"] = video_id
 
-        page.wait_for_timeout(1500)
-        metadata = extract_browser_metadata(page, video_id)
+            await page.goto(
+                row["url"],
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await page.wait_for_timeout(wait_ms)
 
-    if not metadata["title"]:
-        raise RuntimeError("TikTok page loaded but no usable title/description was found.")
+            metadata = await extract_browser_metadata(page, video_id)
 
-    row["title"] = metadata["title"]
-    row["author_name"] = metadata["author_name"]
-    row["thumbnail_url"] = metadata["thumbnail_url"]
+            if not metadata["title"]:
+                raise RuntimeError(
+                    "TikTok page loaded but no usable title/description was found."
+                )
 
-    score, label = score_relevance(row["title"], row.get("keyword", ""))
-    row["relevance_score"] = str(score)
-    row["relevance_label"] = label
-    row["status"] = "metadata_ready"
-    row["notes"] = append_note(row.get("notes", ""), "browser_metadata_enriched")
+            row["title"] = metadata["title"]
+            row["author_name"] = metadata["author_name"]
+            row["thumbnail_url"] = metadata["thumbnail_url"]
 
-    return row
+            score, label = score_relevance(
+                row["title"],
+                row.get("keyword", ""),
+            )
+            row["relevance_score"] = str(score)
+            row["relevance_label"] = label
+            row["status"] = "metadata_ready"
+            row["notes"] = append_note(
+                row.get("notes", ""),
+                "browser_metadata_enriched",
+            )
+
+            detail = (
+                f"{label}({score}) "
+                f"{row['title'][:80]}"
+            )
+            return index, row, detail
+
+        except Exception as exc:
+            row["video_id"] = extract_video_id(row["url"])
+            row["status"] = "metadata_error"
+            row["notes"] = append_note(
+                row.get("notes", ""),
+                f"browser_metadata_error_{type(exc).__name__}",
+            )
+            return index, row, f"ERROR {type(exc).__name__}: {exc}"
+
+        finally:
+            await page.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Open TikTok video URLs in a normal browser, extract page metadata, "
-            "and calculate a simple recipe-relevance baseline."
+            "Enrich TikTok metadata concurrently using multiple Playwright "
+            "pages in one persistent browser context."
         )
     )
     parser.add_argument(
@@ -398,115 +391,119 @@ def parse_args() -> argparse.Namespace:
         help="Re-fetch rows that already have metadata_ready status.",
     )
     parser.add_argument(
-        "--sleep",
-        type=float,
-        default=1.0,
-        help="Seconds between videos (default: 1.0).",
+        "--workers",
+        type=int,
+        default=5,
+        help="Concurrent TikTok pages (default: 5).",
     )
     parser.add_argument(
         "--wait-ms",
         type=int,
-        default=3500,
-        help="Wait after opening each TikTok page (default: 3500ms).",
+        default=3000,
+        help="Wait after opening each TikTok page (default: 3000ms).",
     )
     parser.add_argument(
         "--browser",
         choices=["edge", "chrome", "chromium"],
         default="edge",
-        help="Browser controlled by Playwright (default: edge).",
     )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without visible browser. Visible mode is recommended first.",
-    )
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--profile-dir",
         default=str(DEFAULT_PROFILE_DIR),
-        help="Persistent browser profile directory.",
     )
     return parser.parse_args()
 
 
-def main() -> None:
+async def async_main() -> None:
     args = parse_args()
-
     rows = load_rows()
-    processed = 0
+
+    eligible: list[tuple[int, dict[str, str]]] = []
+
+    for index, row in enumerate(rows):
+        if args.source_id and row["source_id"] != args.source_id:
+            continue
+
+        if not args.force and row.get("status") == "metadata_ready":
+            continue
+
+        eligible.append((index, dict(row)))
+
+    if args.limit is not None:
+        eligible = eligible[: args.limit]
+
+    if not eligible:
+        print("No eligible rows to enrich.")
+        return
+
+    workers = max(1, min(args.workers, len(eligible)))
+    semaphore = asyncio.Semaphore(workers)
+
+    print("=" * 72)
+    print("TikTok Metadata Enrichment - Parallel Browser Mode")
+    print("=" * 72)
+    print(f"Eligible : {len(eligible)}")
+    print(f"Workers  : {workers}")
+    print(f"Browser  : {args.browser}")
+    print(f"Headless : {args.headless}")
+    print(f"CSV      : {SOURCES_PATH}")
+
     success = 0
     failed = 0
 
-    print("=" * 72)
-    print("TikTok Metadata Enrichment - Browser Mode")
-    print("=" * 72)
-    print(f"Input/output : {SOURCES_PATH}")
-    print(f"Browser      : {args.browser}")
-    print(f"Headless     : {args.headless}")
-
-    with sync_playwright() as playwright:
-        context = launch_context(
+    async with async_playwright() as playwright:
+        context = await launch_context(
             playwright=playwright,
             browser_name=args.browser,
             profile_dir=Path(args.profile_dir),
             headless=args.headless,
         )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(12_000)
 
-        for index, row in enumerate(rows):
-            if args.source_id and row["source_id"] != args.source_id:
-                continue
-
-            if not args.force and row.get("status") == "metadata_ready":
-                continue
-
-            if args.limit is not None and processed >= args.limit:
-                break
-
-            processed += 1
-            source_id = row["source_id"]
-            print(f"\n[{processed}] {source_id}")
-            print(f"    {row['url']}")
-
-            try:
-                rows[index] = enrich_row_with_browser(
-                    page=page,
+        tasks = [
+            asyncio.create_task(
+                enrich_one(
+                    context=context,
+                    semaphore=semaphore,
+                    index=index,
                     row=row,
                     wait_ms=args.wait_ms,
-                    headless=args.headless,
                 )
+            )
+            for index, row in eligible
+        ]
+
+        for task in asyncio.as_completed(tasks):
+            index, updated_row, detail = await task
+            rows[index] = updated_row
+
+            if updated_row.get("status") == "metadata_ready":
                 success += 1
-
-                print(f"    title     : {rows[index]['title'][:120]}")
-                print(f"    author    : {rows[index]['author_name'][:80]}")
-                print(
-                    f"    relevance : {rows[index]['relevance_label']} "
-                    f"({rows[index]['relevance_score']})"
-                )
-
-            except Exception as exc:
+            else:
                 failed += 1
-                row["video_id"] = extract_video_id(row["url"])
-                row["status"] = "metadata_error"
-                row["notes"] = append_note(
-                    row.get("notes", ""),
-                    f"browser_metadata_error_{type(exc).__name__}",
-                )
-                print(f"    ERROR {type(exc).__name__}: {exc}")
 
+            # Single writer in the event loop: no concurrent CSV writes.
             write_rows(rows)
 
-            if args.sleep > 0:
-                time.sleep(args.sleep)
+            print(
+                f"{updated_row['source_id']:8} "
+                f"{updated_row.get('status', ''):16} "
+                f"{detail}"
+            )
 
-        context.close()
+        await context.close()
 
-    print("\n" + "=" * 72)
+    print()
+    print("=" * 72)
     print("DONE")
-    print(f"Processed : {processed}")
+    print(f"Processed : {len(eligible)}")
     print(f"Success   : {success}")
     print(f"Failed    : {failed}")
     print("=" * 72)
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
