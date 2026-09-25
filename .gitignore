@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data - keep raw/large files local
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+dataset/ingredients/images/
+dataset/ingredients/annotations/*
+!dataset/ingredients/annotations/.gitkeep
+
+# Models / vector stores / outputs
+models/
+weights/
+runs/
+outputs/
+experiments/**/artifacts/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.faiss
+
+# Audio / video
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+*.m4a
+
+# Secrets
+*.key
+secrets.*
