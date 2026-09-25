@@ -5,6 +5,7 @@ import asyncio
 import csv
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,9 @@ async def submit_and_capture(
     page: Page,
     tiktok_url: str,
     timeout_seconds: float,
+    submit_gate: asyncio.Lock,
+    submit_state: dict[str, float],
+    submit_gap_seconds: float,
 ) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     result_future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -217,6 +221,22 @@ async def submit_and_capture(
         try:
             body = await response.json()
         except Exception:
+            body = None
+
+        if response.status >= 400:
+            try:
+                raw_body = await response.text()
+            except Exception:
+                raw_body = ""
+
+            request_body = response.request.post_data or ""
+            detail = (
+                f"HTTP {response.status} from {response.url}; "
+                f"response={raw_body[:800]!r}; "
+                f"request={request_body[:800]!r}"
+            )
+            if not result_future.done():
+                result_future.set_exception(SavetoBrowserError(detail))
             return
 
         if not isinstance(body, dict):
@@ -248,7 +268,21 @@ async def submit_and_capture(
     url_input = await find_url_input(page)
     await url_input.fill(tiktok_url)
     await page.wait_for_timeout(300)
-    await click_generate(page, url_input)
+
+    # Keep transcript generation parallel, but serialize/stagger the very
+    # short submit step. This avoids a burst of simultaneous POST requests
+    # from one shared browser session while all accepted tasks can continue
+    # polling concurrently afterwards.
+    async with submit_gate:
+        now = time.monotonic()
+        last_submit = submit_state.get("last_submit", 0.0)
+        wait_for = submit_gap_seconds - (now - last_submit)
+
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+
+        await click_generate(page, url_input)
+        submit_state["last_submit"] = time.monotonic()
 
     try:
         return await asyncio.wait_for(
@@ -302,6 +336,10 @@ async def process_one(
     row: dict[str, str],
     timeout_seconds: float,
     force: bool,
+    submit_gate: asyncio.Lock,
+    submit_state: dict[str, float],
+    submit_gap_seconds: float,
+    retries: int,
 ) -> dict[str, str]:
     source_id = row.get("source_id", "")
     url = row.get("url", "")
@@ -317,36 +355,47 @@ async def process_one(
         }
 
     async with semaphore:
-        page = await context.new_page()
+        last_error = ""
 
-        try:
-            result = await submit_and_capture(
-                page=page,
-                tiktok_url=url,
-                timeout_seconds=timeout_seconds,
-            )
+        for attempt in range(retries + 1):
+            page = await context.new_page()
 
-            txt_path, _ = save_result(row, result)
+            try:
+                result = await submit_and_capture(
+                    page=page,
+                    tiktok_url=url,
+                    timeout_seconds=timeout_seconds,
+                    submit_gate=submit_gate,
+                    submit_state=submit_state,
+                    submit_gap_seconds=submit_gap_seconds,
+                )
 
-            return {
-                "source_id": source_id,
-                "url": url,
-                "status": "success",
-                "detail": (
-                    f"{len(result.get('text', ''))} chars -> {txt_path}"
-                ),
-            }
+                txt_path, _ = save_result(row, result)
 
-        except Exception as exc:
-            return {
-                "source_id": source_id,
-                "url": url,
-                "status": "failed",
-                "detail": f"{type(exc).__name__}: {exc}",
-            }
+                return {
+                    "source_id": source_id,
+                    "url": url,
+                    "status": "success",
+                    "detail": (
+                        f"{len(result.get('text', ''))} chars -> {txt_path}"
+                    ),
+                }
 
-        finally:
-            await page.close()
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+                if attempt < retries:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+
+            finally:
+                await page.close()
+
+        return {
+            "source_id": source_id,
+            "url": url,
+            "status": "failed",
+            "detail": last_error,
+        }
 
 
 def write_report(results: list[dict[str, str]]) -> None:
@@ -396,6 +445,21 @@ def parse_args() -> argparse.Namespace:
         help="Per-video timeout (default: 180 seconds).",
     )
     parser.add_argument(
+        "--submit-gap",
+        type=float,
+        default=2.0,
+        help=(
+            "Minimum seconds between Saveto submit clicks in the shared "
+            "session (default: 2.0). Polling still runs in parallel."
+        ),
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Retry failed videos with a fresh page (default: 2).",
+    )
+    parser.add_argument(
         "--browser",
         choices=["edge", "chrome", "chromium"],
         default="edge",
@@ -438,6 +502,8 @@ async def async_main() -> None:
 
     workers = max(1, min(args.workers, len(rows)))
     semaphore = asyncio.Semaphore(workers)
+    submit_gate = asyncio.Lock()
+    submit_state: dict[str, float] = {"last_submit": 0.0}
 
     print("=" * 72)
     print("Saveto Playwright Transcript Batch")
@@ -446,6 +512,8 @@ async def async_main() -> None:
     print(f"Workers  : {workers}")
     print(f"Browser  : {args.browser}")
     print(f"Headless : {args.headless}")
+    print(f"Submit gap: {args.submit_gap}s")
+    print(f"Retries   : {args.retries}")
     print()
 
     async with async_playwright() as playwright:
@@ -464,6 +532,10 @@ async def async_main() -> None:
                     row=row,
                     timeout_seconds=args.timeout_seconds,
                     force=args.force,
+                    submit_gate=submit_gate,
+                    submit_state=submit_state,
+                    submit_gap_seconds=args.submit_gap,
+                    retries=args.retries,
                 )
             )
             for row in rows
