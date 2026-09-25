@@ -399,11 +399,23 @@ def stream_candidates_to_wav(
 def whisper_transcribe(
     audio_path: Path,
     model: Any,
+    title: str = "",
 ) -> dict[str, Any]:
+    context_title = " ".join((title or "").split())[:300]
+    initial_prompt = RECIPE_VOCAB_PROMPT
+
+    if context_title:
+        initial_prompt += f" Tiêu đề/caption của video: {context_title}"
+
     result = model.transcribe(
         str(audio_path),
         language="vi",
         verbose=False,
+        temperature=0,
+        beam_size=5,
+        initial_prompt=initial_prompt,
+        carry_initial_prompt=True,
+        condition_on_previous_text=True,
     )
 
     segments = [
@@ -482,9 +494,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--whisper-model",
-        default="base",
+        default="small",
         choices=["tiny", "base", "small", "medium", "large"],
-        help="Whisper model (default: base).",
+        help="Whisper model (default: small for better Vietnamese accuracy).",
     )
     parser.add_argument(
         "--force",
@@ -618,6 +630,7 @@ def main() -> None:
                     transcript = whisper_transcribe(
                         audio_path=wav_path,
                         model=model,
+                        title=row.get("title", ""),
                     )
 
                 result = {
