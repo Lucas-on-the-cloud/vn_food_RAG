@@ -81,44 +81,87 @@ def looks_like_media(url: str, content_type: str = "") -> bool:
     )
 
 
-def choose_media_url(
+
+def build_media_candidates(
     current_src: str,
     captured: list[dict[str, str]],
-) -> str | None:
-    """Prefer the exact media source used by the <video> element.
+) -> list[dict[str, str]]:
+    """Return unique candidate media streams in audio-first order.
 
-    If TikTok exposes only a blob: URL, fall back to HTTP media responses
-    captured while the browser loaded the page.
+    TikTok may load separate video-only and audio-only streams. The previous
+    implementation preferred the video response, which can contain no audio at
+    all. This function keeps every useful response and tries likely audio
+    streams first.
     """
 
+    candidates: list[dict[str, str]] = []
+
     if is_http_media_url(current_src):
-        return current_src
-
-    usable = [
-        item
-        for item in captured
-        if is_http_media_url(item.get("url", ""))
-        and looks_like_media(
-            item.get("url", ""),
-            item.get("content_type", ""),
+        candidates.append(
+            {
+                "url": current_src,
+                "content_type": "",
+                "source": "video.currentSrc",
+            }
         )
-    ]
 
-    if not usable:
-        return None
+    for item in captured:
+        media_url = item.get("url", "")
+        content_type = item.get("content_type", "")
 
-    # Prefer video responses because they contain the exact mixed audio heard
-    # in the TikTok video. Separate audio requests may represent only a music
-    # track rather than the creator's full spoken audio.
-    video_candidates = [
-        item
-        for item in usable
-        if item.get("content_type", "").lower().startswith("video/")
-        or "mime_type=video" in item.get("url", "").lower()
-    ]
+        if not is_http_media_url(media_url):
+            continue
 
-    selected = video_candidates[-1] if video_candidates else usable[-1]
-    return selected["url"]
+        if not looks_like_media(media_url, content_type):
+            continue
+
+        candidates.append(
+            {
+                "url": media_url,
+                "content_type": content_type,
+                "source": "network",
+            }
+        )
+
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for item in candidates:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        unique.append(item)
+
+    def priority(item: dict[str, str]) -> tuple[int, int]:
+        url = item["url"].lower()
+        content_type = item.get("content_type", "").lower()
+
+        audio_like = (
+            content_type.startswith("audio/")
+            or "mime_type=audio" in url
+            or "/audio/" in url
+        )
+        video_like = (
+            content_type.startswith("video/")
+            or "mime_type=video" in url
+            or "/video/" in url
+        )
+
+        if audio_like:
+            kind_rank = 0
+        elif video_like:
+            kind_rank = 1
+        else:
+            kind_rank = 2
+
+        # Network responses usually carry more reliable content-type metadata
+        # than video.currentSrc.
+        source_rank = 0 if item.get("source") == "network" else 1
+
+        return kind_rank, source_rank
+
+    unique.sort(key=priority)
+    return unique
 
 
 def get_current_video_src(page: Page) -> str:
@@ -138,12 +181,13 @@ def get_current_video_src(page: Page) -> str:
         return ""
 
 
-def collect_media_url(
+
+def collect_media_candidates(
     page: Page,
     url: str,
     wait_ms: int,
     headless: bool,
-) -> tuple[str, str]:
+) -> tuple[list[dict[str, str]], str]:
     captured: list[dict[str, str]] = []
 
     def on_response(response: Any) -> None:
@@ -160,7 +204,6 @@ def collect_media_url(
                     }
                 )
         except Exception:
-            # Network-event parsing should never crash the transcription run.
             pass
 
     page.on("response", on_response)
@@ -168,12 +211,36 @@ def collect_media_url(
     page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(wait_ms)
 
-    current_src = get_current_video_src(page)
-    media_url = choose_media_url(current_src, captured)
+    # Ask the actual video element to play so TikTok has a chance to request
+    # any separate audio stream.
+    video = page.locator("video")
+    if video.count() > 0:
+        try:
+            video.first.evaluate(
+                """async (v) => {
+                    try {
+                        v.muted = false;
+                        v.volume = 0.01;
+                        await v.play();
+                    } catch (_) {
+                        try {
+                            v.muted = true;
+                            await v.play();
+                        } catch (_) {}
+                    }
+                }"""
+            )
+        except Exception:
+            pass
 
-    if media_url is None and not headless:
+    page.wait_for_timeout(2_000)
+
+    current_src = get_current_video_src(page)
+    candidates = build_media_candidates(current_src, captured)
+
+    if not candidates and not headless:
         print(
-            "    No media URL found yet. If TikTok shows login/CAPTCHA/"
+            "    No media stream found yet. If TikTok shows login/CAPTCHA/"
             "verification, complete it in Edge, then press ENTER here."
         )
         try:
@@ -182,34 +249,17 @@ def collect_media_url(
             pass
 
         page.wait_for_timeout(2_000)
-
-        # Encourage the media element to actually load/play.
-        video = page.locator("video")
-        if video.count() > 0:
-            try:
-                video.first.evaluate(
-                    """async (v) => {
-                        v.muted = true;
-                        try { await v.play(); } catch (_) {}
-                    }"""
-                )
-            except Exception:
-                pass
-
-        page.wait_for_timeout(2_000)
         current_src = get_current_video_src(page)
-        media_url = choose_media_url(current_src, captured)
+        candidates = build_media_candidates(current_src, captured)
 
-    if media_url is None:
+    if not candidates:
         raise RuntimeError(
-            "TikTok page opened, but no HTTP media stream could be captured."
+            "TikTok page opened, but no HTTP media streams could be captured."
         )
 
-    user_agent = str(
-        page.evaluate("() => navigator.userAgent") or ""
-    ).strip()
+    user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip()
 
-    return media_url, user_agent
+    return candidates, user_agent
 
 
 def build_cookie_header(
@@ -230,24 +280,19 @@ def build_cookie_header(
     return "; ".join(pairs)
 
 
-def stream_media_to_wav(
+
+def stream_one_candidate_to_wav(
     media_url: str,
     wav_path: Path,
     user_agent: str,
     referer: str,
     cookie_header: str,
-) -> None:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "FFmpeg was not found in PATH. Run: ffmpeg -version"
-        )
-
+) -> tuple[bool, str]:
     headers = [f"Referer: {referer}"]
 
     if cookie_header:
         headers.append(f"Cookie: {cookie_header}")
 
-    # FFmpeg expects CRLF-separated HTTP headers.
     header_value = "\r\n".join(headers) + "\r\n"
 
     command = [
@@ -266,6 +311,8 @@ def stream_media_to_wav(
             header_value,
             "-i",
             media_url,
+            "-map",
+            "0:a:0",
             "-vn",
             "-ac",
             "1",
@@ -285,15 +332,68 @@ def stream_media_to_wav(
         errors="replace",
     )
 
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
+    ok = (
+        result.returncode == 0
+        and wav_path.exists()
+        and wav_path.stat().st_size > 44
+    )
+
+    details = (result.stderr or result.stdout or "").strip()
+    return ok, details
+
+
+def stream_candidates_to_wav(
+    context: BrowserContext,
+    candidates: list[dict[str, str]],
+    wav_path: Path,
+    user_agent: str,
+    referer: str,
+) -> dict[str, str]:
+    """Try captured TikTok media responses until one yields an audio stream."""
+
+    if shutil.which("ffmpeg") is None:
         raise RuntimeError(
-            "FFmpeg could not read the TikTok media stream. "
-            f"Details: {details[-1000:]}"
+            "FFmpeg was not found in PATH. Run: ffmpeg -version"
         )
 
-    if not wav_path.exists() or wav_path.stat().st_size == 0:
-        raise RuntimeError("FFmpeg completed but produced no audio WAV file.")
+    errors: list[str] = []
+
+    for index, candidate in enumerate(candidates, start=1):
+        media_url = candidate["url"]
+        content_type = candidate.get("content_type", "")
+        cookie_header = build_cookie_header(context, media_url)
+
+        if wav_path.exists():
+            wav_path.unlink()
+
+        print(
+            f"    try    : media candidate {index}/{len(candidates)} "
+            f"[{content_type or 'unknown'}]"
+        )
+
+        ok, details = stream_one_candidate_to_wav(
+            media_url=media_url,
+            wav_path=wav_path,
+            user_agent=user_agent,
+            referer=referer,
+            cookie_header=cookie_header,
+        )
+
+        if ok:
+            return candidate
+
+        compact = " ".join(details.split())
+        if len(compact) > 300:
+            compact = compact[-300:]
+
+        errors.append(
+            f"candidate {index} ({content_type or 'unknown'}): {compact}"
+        )
+
+    raise RuntimeError(
+        "Captured TikTok media streams, but none contained readable audio. "
+        + " | ".join(errors[-3:])
+    )
 
 
 def whisper_transcribe(
@@ -481,33 +581,38 @@ def main() -> None:
             print(f"    {source_url}")
 
             try:
-                media_url, user_agent = collect_media_url(
+                candidates, user_agent = collect_media_candidates(
                     page=page,
                     url=source_url,
                     wait_ms=args.wait_ms,
                     headless=args.headless,
                 )
 
-                print("    media  : captured from browser")
-
-                cookie_header = build_cookie_header(context, media_url)
+                print(
+                    f"    media  : captured {len(candidates)} "
+                    "candidate stream(s)"
+                )
 
                 with tempfile.TemporaryDirectory(
                     prefix="vn_food_rag_"
                 ) as temp_dir:
                     wav_path = Path(temp_dir) / f"{source_id}.wav"
 
-                    stream_media_to_wav(
-                        media_url=media_url,
+                    selected_media = stream_candidates_to_wav(
+                        context=context,
+                        candidates=candidates,
                         wav_path=wav_path,
                         user_agent=user_agent,
                         referer=source_url,
-                        cookie_header=cookie_header,
                     )
 
                     print(
                         f"    audio  : temporary WAV "
                         f"({wav_path.stat().st_size // 1024} KiB)"
+                    )
+                    print(
+                        "    source : "
+                        f"{selected_media.get('content_type') or 'unknown'}"
                     )
 
                     transcript = whisper_transcribe(
