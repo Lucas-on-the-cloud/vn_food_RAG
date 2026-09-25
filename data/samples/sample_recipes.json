@@ -1,0 +1,84 @@
+[
+  {
+    "recipe_id": "VN0001",
+    "dish_name_vi": "Thịt ba chỉ rim trứng",
+    "dish_name_en": "Caramelized Pork Belly with Eggs",
+    "source_url": "",
+    "source_platform": "manual_sample",
+    "cooking_time_minutes": 30,
+    "difficulty": "beginner",
+    "estimated_cost_twd": 95,
+    "equipment": ["pan"],
+    "ingredients": [
+      {
+        "canonical_name_en": "pork_belly",
+        "name_vi": "thịt ba chỉ",
+        "name_zh_tw": "五花肉",
+        "quantity": "300g",
+        "optional": false
+      },
+      {
+        "canonical_name_en": "egg",
+        "name_vi": "trứng gà",
+        "name_zh_tw": "雞蛋",
+        "quantity": "2",
+        "optional": false
+      },
+      {
+        "canonical_name_en": "green_onion",
+        "name_vi": "hành lá",
+        "name_zh_tw": "青蔥",
+        "quantity": "1 stalk",
+        "optional": true
+      }
+    ],
+    "steps": [
+      "Cut pork belly into bite-sized pieces.",
+      "Boil and peel the eggs.",
+      "Season the pork and simmer until cooked.",
+      "Add eggs and continue simmering until the sauce reduces."
+    ],
+    "tags": ["student-friendly", "one-pan", "vietnamese"]
+  },
+  {
+    "recipe_id": "VN0002",
+    "dish_name_vi": "Đậu phụ xào thịt băm",
+    "dish_name_en": "Stir-fried Tofu with Minced Pork",
+    "source_url": "",
+    "source_platform": "manual_sample",
+    "cooking_time_minutes": 20,
+    "difficulty": "beginner",
+    "estimated_cost_twd": 75,
+    "equipment": ["pan"],
+    "ingredients": [
+      {
+        "canonical_name_en": "tofu",
+        "name_vi": "đậu phụ",
+        "name_zh_tw": "豆腐",
+        "quantity": "1 block",
+        "optional": false
+      },
+      {
+        "canonical_name_en": "minced_pork",
+        "name_vi": "thịt heo xay",
+        "name_zh_tw": "豬絞肉",
+        "quantity": "150g",
+        "optional": false
+      },
+      {
+        "canonical_name_en": "green_onion",
+        "name_vi": "hành lá",
+        "name_zh_tw": "青蔥",
+        "quantity": "1 stalk",
+        "optional": true
+      }
+    ],
+    "steps": [
+      "Cut tofu into cubes.",
+      "Stir-fry minced pork until cooked.",
+      "Add tofu and seasoning.",
+      "Cook gently for several minutes and garnish with green onion."
+    ],
+    "tags": ["student-friendly", "quick", "vietnamese"]
+  }
+]
