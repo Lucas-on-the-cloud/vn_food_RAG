@@ -9,7 +9,7 @@ from filter_transcripts import classify
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST = ROOT / "data" / "transcripts" / "saveto_batch_10.csv"
+DEFAULT_MANIFEST = ROOT / "data" / "transcripts" / "saveto_batch.csv"
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "processed" / "saveto"
 
 
