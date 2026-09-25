@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VNFoodRecipe",
+  "type": "object",
+  "required": [
+    "recipe_id",
+    "dish_name_vi",
+    "ingredients",
+    "steps"
+  ],
+  "properties": {
+    "recipe_id": {"type": "string"},
+    "dish_name_vi": {"type": "string"},
+    "dish_name_en": {"type": "string"},
+    "source_url": {"type": "string"},
+    "source_platform": {"type": "string"},
+    "cooking_time_minutes": {"type": "integer", "minimum": 0},
+    "difficulty": {
+      "type": "string",
+      "enum": ["beginner", "easy", "medium", "hard"]
+    },
+    "estimated_cost_twd": {"type": "number", "minimum": 0},
+    "equipment": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "ingredients": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["canonical_name_en", "name_vi"],
+        "properties": {
+          "canonical_name_en": {"type": "string"},
+          "name_vi": {"type": "string"},
+          "name_zh_tw": {"type": "string"},
+          "quantity": {"type": "string"},
+          "optional": {"type": "boolean"}
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}
