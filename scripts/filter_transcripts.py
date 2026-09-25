@@ -97,7 +97,7 @@ def classify(text: str) -> tuple[str, str, dict[str, float | int]]:
     if dominance >= 0.30:
         return "rejected", "token_hallucination", metrics
 
-    if any(contains_term(normalized, term) for term in JUNK_TERMS) and hits < 2:
+    if any(contains_term(normalized, term) for term in JUNK_TERMS) and hits <= 3:
         return "rejected", "junk_or_subscription", metrics
 
     music_hits = sum(
@@ -114,6 +114,9 @@ def classify(text: str) -> tuple[str, str, dict[str, float | int]]:
         return "review", "high_repetition", metrics
 
     if hits < 2:
+        return "review", "weak_recipe_signal", metrics
+
+    if word_count >= 150 and hits <= 3:
         return "review", "weak_recipe_signal", metrics
 
     return "accepted", "recipe_candidate", metrics
