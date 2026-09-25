@@ -1,0 +1,21 @@
+class_id,canonical_name_en,name_vi,name_zh_tw,category
+0,egg,trứng gà,雞蛋,protein
+1,pork_belly,thịt ba chỉ,五花肉,protein
+2,minced_pork,thịt heo xay,豬絞肉,protein
+3,chicken_breast,ức gà,雞胸肉,protein
+4,chicken_thigh,đùi gà,雞腿肉,protein
+5,tofu,đậu phụ,豆腐,protein
+6,water_spinach,rau muống,空心菜,vegetable
+7,bok_choy,cải thìa,青江菜,vegetable
+8,cabbage,bắp cải,高麗菜,vegetable
+9,tomato,cà chua,番茄,vegetable
+10,potato,khoai tây,馬鈴薯,vegetable
+11,carrot,cà rốt,紅蘿蔔,vegetable
+12,onion,hành tây,洋蔥,vegetable
+13,garlic,tỏi,大蒜,aromatic
+14,enoki_mushroom,nấm kim châm,金針菇,mushroom
+15,oyster_mushroom,nấm bào ngư,蠔菇,mushroom
+16,green_onion,hành lá,青蔥,aromatic
+17,ginger,gừng,薑,aromatic
+18,rice,gạo,白米,staple
+19,instant_noodles,mì gói,泡麵,staple
